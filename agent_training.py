@@ -1,13 +1,9 @@
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
 from voxel_env import VoxelEnv, export_voxel_grid
 import os
 
-# Create environment
 env = VoxelEnv(grid_size=5)
-check_env(env)
 
-# PPO agent with tuned hyperparameters (no tensorboard)
 model = PPO(
     "MlpPolicy",
     env,
@@ -23,21 +19,22 @@ model = PPO(
     clip_range=0.2,
 )
 
-# Train agent
+print("Starting training...")
 model.learn(total_timesteps=50000)
+print("Training completed")
 
-# Output folder for voxel states
 output_folder = "output_steps"
 os.makedirs(output_folder, exist_ok=True)
 
-# Rollout for visualization
 obs, info = env.reset()
+
+print("Exporting voxel states for visualization...")
 for step in range(20):
-    action, _states = model.predict(obs, deterministic=True)
-    obs, reward, terminated, truncated, info = env.step(action)
+    action_idx = model.predict(obs, deterministic=True)[0]
+    obs, reward, terminated, truncated, info = env.step(action_idx)
     done = terminated or truncated
 
-    print(f"Step {step}: Action: {action} | Reward: {reward}")
+    print(f"Step {step}: Action Index: {action_idx} | Available: {len(env.available_actions)} | Reward: {reward}")
     env.render()
 
     filename = os.path.join(output_folder, f"step_{step:03}.json")
@@ -46,4 +43,4 @@ for step in range(20):
     if done:
         obs, info = env.reset()
 
-print(f"Exported voxel states to folder: {output_folder}")
+print(f"Exported voxel states to: {output_folder}")
