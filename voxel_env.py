@@ -114,17 +114,27 @@ class VoxelEnv(Env):
                         if not content:
                             raise ValueError("Empty file")
                         data = json.loads(content)
-                    os.remove(reward_file)
+                    
+                    # ✅ Wait until file is unlocked before deleting
+                    for _ in range(10):
+                        try:
+                            os.remove(reward_file)
+                            break
+                        except PermissionError:
+                            time.sleep(0.1)
+
                     return float(data.get("reward", 0.0))
+
                 except (json.JSONDecodeError, ValueError) as e:
-                    # File exists but not ready yet — wait and retry
-                    print(f"Waiting for valid reward file... ({e})")
+                    print(f"⏳ Waiting for valid reward file... ({e})")
                     time.sleep(0.1)
+
             else:
                 if time.time() - start_time > timeout:
-                    print("Timeout: No external reward received.")
+                    print("❌ Timeout: No external reward received.")
                     return 0.0
                 time.sleep(0.1)
+
 
 
 
