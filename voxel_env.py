@@ -100,19 +100,32 @@ class VoxelEnv(Env):
         export_voxel_grid(self.grid, "temp_voxel_input.json")
 
     def _wait_for_external_reward(self, timeout=10):
+        import time
+        import json
+
         reward_file = "temp_reward.json"
         start_time = time.time()
 
-        while not os.path.exists(reward_file):
-            if time.time() - start_time > timeout:
-                print("Timeout: No external reward received.")
-                return 0.0
-            time.sleep(0.1)
+        while True:
+            if os.path.exists(reward_file):
+                try:
+                    with open(reward_file, 'r') as f:
+                        content = f.read().strip()
+                        if not content:
+                            raise ValueError("Empty file")
+                        data = json.loads(content)
+                    os.remove(reward_file)
+                    return float(data.get("reward", 0.0))
+                except (json.JSONDecodeError, ValueError) as e:
+                    # File exists but not ready yet — wait and retry
+                    print(f"Waiting for valid reward file... ({e})")
+                    time.sleep(0.1)
+            else:
+                if time.time() - start_time > timeout:
+                    print("Timeout: No external reward received.")
+                    return 0.0
+                time.sleep(0.1)
 
-        with open(reward_file, 'r') as f:
-            data = json.load(f)
-        os.remove(reward_file)
-        return float(data.get("reward", 0.0))
 
 
 def export_voxel_grid(grid, filename):
