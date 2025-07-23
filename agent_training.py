@@ -23,6 +23,7 @@ print("Starting training...")
 model.learn(total_timesteps=50000)
 print("Training completed")
 
+# Post-training evaluation (optional visualization export)
 output_folder = "output_steps"
 os.makedirs(output_folder, exist_ok=True)
 
@@ -30,7 +31,7 @@ obs, info = env.reset()
 
 print("Exporting voxel states for visualization...")
 for step in range(20):
-    action_idx = model.predict(obs, deterministic=True)[0]
+    action_idx, _states = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = env.step(action_idx)
     done = terminated or truncated
 

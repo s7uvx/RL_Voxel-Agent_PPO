@@ -1,4 +1,7 @@
 import numpy as np
+import os
+import time
+import json
 from gymnasium import Env, spaces
 
 
@@ -8,8 +11,7 @@ class VoxelEnv(Env):
         self.grid_size = grid_size
         self.grid = np.zeros((grid_size, grid_size, grid_size), dtype=np.int32)
 
-        self.action_space = spaces.Discrete(1)  
-
+        self.action_space = spaces.Discrete(1)
         self.observation_space = spaces.Box(
             low=0, high=1,
             shape=(grid_size * grid_size * grid_size,),
@@ -21,7 +23,6 @@ class VoxelEnv(Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.grid = np.zeros_like(self.grid, dtype=np.int32)
-
         center = self.grid_size // 2
         self.grid[center, center, center] = 1
         self._update_available_actions()
@@ -68,7 +69,6 @@ class VoxelEnv(Env):
 
     def _update_available_actions(self):
         possible = set()
-
         for x in range(self.grid_size):
             for y in range(self.grid_size):
                 for z in range(self.grid_size):
@@ -86,36 +86,36 @@ class VoxelEnv(Env):
                                 self.grid[nx, ny, nz] == 0
                             ):
                                 possible.add((nx, ny, nz))
-
         self.available_actions = list(possible)
 
     def _calculate_reward(self, x, y, z):
-        reward = 0.0
-
         if self.grid[x, y, z] == 0:
             self.grid[x, y, z] = 1
-            num_neighbors = self._count_neighbors(x, y, z)
-
-            if num_neighbors == 1:
-                reward += 1.0
-            elif 2 <= num_neighbors <= 3:
-                reward += 1.5
-            elif 4 <= num_neighbors <= 6:
-                reward += 2.0
-            else:
-                reward -= 0.5
+            self._write_grid_to_temp_file()
+            return self._wait_for_external_reward()
         else:
-            reward -= 0.2
+            return -0.2
 
-        total_voxels = self.grid_size ** 3
-        if np.sum(self.grid) >= 0.5 * total_voxels:
-            reward += 10.0
+    def _write_grid_to_temp_file(self):
+        export_voxel_grid(self.grid, "temp_voxel_input.json")
 
-        return reward
+    def _wait_for_external_reward(self, timeout=10):
+        reward_file = "temp_reward.json"
+        start_time = time.time()
+
+        while not os.path.exists(reward_file):
+            if time.time() - start_time > timeout:
+                print("Timeout: No external reward received.")
+                return 0.0
+            time.sleep(0.1)
+
+        with open(reward_file, 'r') as f:
+            data = json.load(f)
+        os.remove(reward_file)
+        return float(data.get("reward", 0.0))
 
 
 def export_voxel_grid(grid, filename):
-    import json
     data = {"voxels": grid.tolist()}
     with open(filename, 'w') as f:
         json.dump(data, f)
