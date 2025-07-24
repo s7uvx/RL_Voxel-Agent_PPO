@@ -1,0 +1,14 @@
+[project]
+name = "rl-voxel-agent-ppo-v1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "stable-baselines3[extra]>=2.6.0",
+    "tensorboard>=2.20.0",
+    "torch",
+]
+
+[tool.uv.sources]
+torch = { path = "../../Users/cawn069856/Downloads/torch-2.7.0+cu128-cp312-cp312-win_amd64.whl" }
