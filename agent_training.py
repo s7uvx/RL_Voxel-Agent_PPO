@@ -9,10 +9,14 @@ import os
 gpu_available = torch.cuda.is_available()
 print(f"GPU available: {gpu_available}")
 print("Using CPU for PPO training (recommended for MLP policies)")
-
+num_env = 0
+port_list = [6500,6001,6002,6003]
 # Create vectorized environment
 def make_env():
-    return VoxelEnv(grid_size=6, device='cpu')  # Use CPU for environments too
+    global num_env, port_list
+    env = VoxelEnv(port = port_list[num_env], grid_size=6, device='cpu')  # Use CPU for environments too
+    num_env+=1
+    return env
 
 # Use vectorized environment for better performance
 num_envs = 1  # Can use more envs on CPU since we're not GPU-limited
@@ -45,7 +49,7 @@ model.save("ppo_voxel_model")
 
 # Post-training evaluation with single environment
 print("Starting evaluation...")
-eval_env = VoxelEnv(grid_size=6, device='cpu')  # Use CPU for evaluation too
+eval_env = VoxelEnv(port=6004, grid_size=6, device='cpu')  # Use CPU for evaluation too
 output_folder = "output_steps_vec"
 os.makedirs(output_folder, exist_ok=True)
 

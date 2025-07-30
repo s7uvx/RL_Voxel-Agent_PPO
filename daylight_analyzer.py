@@ -6,9 +6,6 @@ import zipfile
 import tempfile
 from typing import List, Tuple, Dict, Optional
 
-from ladybug_geometry.geometry3d.pointvector import Point3D, Vector3D
-from ladybug_geometry.geometry3d.face import Face3D
-from ladybug_geometry.geometry3d.polyface import Polyface3D
 from honeybee.room import Room
 from honeybee.model import Model
 from honeybee_radiance.sensorgrid import SensorGrid

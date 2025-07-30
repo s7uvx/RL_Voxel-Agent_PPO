@@ -2,11 +2,14 @@ import numpy as np
 import os
 import json
 import torch
+import time
 from gymnasium import Env, spaces
+
+from gh_file_runner import get_reward_gh
 
 
 class VoxelEnv(Env):
-    def __init__(self, grid_size=5, device=None):
+    def __init__(self, port, grid_size=5, device=None):
         super(VoxelEnv, self).__init__()
         self.grid_size = grid_size
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -21,6 +24,7 @@ class VoxelEnv(Env):
 
         self.available_actions = []
         self.timeouts = 0
+        self.port = port
 
     def reset(self, seed=None):
         super().reset(seed=seed)
@@ -130,17 +134,17 @@ class VoxelEnv(Env):
     def _calculate_reward(self, x, y, z):
         if self.grid[x, y, z] == 0:
             self.grid[x, y, z] = 1
-            self._write_grid_to_temp_file()
-            return self._wait_for_external_reward()
+            reward = get_reward_gh(json.dumps(self.grid.tolist()), self.port)
+            return reward
+            # self._write_grid_to_temp_file()
+            # return self._wait_for_external_reward()
         else:
             return -0.2
 
     def _write_grid_to_temp_file(self):
         export_voxel_grid(self.grid, "temp_voxel_input.json")
 
-    def _wait_for_external_reward(self, timeout=10):
-        import time
-        import json
+    def _wait_for_external_reward(self, timeout=30):
         global timeouts
 
         reward_file = "temp_reward.json"

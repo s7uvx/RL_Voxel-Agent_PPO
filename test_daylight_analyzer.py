@@ -105,7 +105,7 @@ def test_voxel_env_integration():
     from voxel_env import VoxelEnv
     
     # Create a VoxelEnv and take some steps
-    env = VoxelEnv(grid_size=3, device='cpu')
+    env = VoxelEnv(port=6500, grid_size=3, device='cpu')
     obs, info = env.reset()
     
     # Take a few random steps to build some geometry
