@@ -4,8 +4,8 @@ import json
 import torch
 import time
 from gymnasium import Env, spaces
-
-from gh_file_runner import get_reward_gh
+import compute_rhino3d.Util
+import compute_rhino3d.Grasshopper as gh
 
 
 class VoxelEnv(Env):
@@ -25,6 +25,19 @@ class VoxelEnv(Env):
         self.available_actions = []
         self.timeouts = 0
         self.port = port
+        self.gh_file = os.path.join(os.getcwd(),'gh_files','RL_Voxel_V4_hops.gh')
+
+    def get_reward_gh(self) -> float:
+        if self.grid is None:
+            return -0.2
+        else:
+            compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
+            voxel_in = gh.DataTree("RH_IN:voxel_json")
+            voxel_in.Append([0], [json.dumps(self.grid.tolist())])
+            output = gh.EvaluateDefinition(self.gh_file, [voxel_in])
+            # print(output['values'][0]['InnerTree'])
+            reward = str(output['values'][0]['InnerTree']['{0;0}'][0]['data'])
+            return float(reward)
 
     def reset(self, seed=None):
         super().reset(seed=seed)
@@ -134,7 +147,7 @@ class VoxelEnv(Env):
     def _calculate_reward(self, x, y, z):
         if self.grid[x, y, z] == 0:
             self.grid[x, y, z] = 1
-            reward = get_reward_gh(json.dumps(self.grid.tolist()), self.port)
+            reward = self.get_reward_gh()
             return reward
             # self._write_grid_to_temp_file()
             # return self._wait_for_external_reward()
