@@ -14,6 +14,9 @@ class VoxelEnv(Env):
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.grid = np.zeros((grid_size, grid_size, grid_size), dtype=np.int32)
 
+        #initialize the first voxel randomly in the center of the bottom
+        self.grid[np.random.randint(0,grid_size), np.random.randint(0,grid_size), 0] = 1
+
         self.action_space = spaces.Discrete(1)
         self.observation_space = spaces.Box(
             low=0, high=1,
@@ -35,18 +38,19 @@ class VoxelEnv(Env):
         return float(numeric_part)
 
     def get_reward_gh(self) -> float:
-        #TODO: this is not passing the voxels to rhino.compute it seems!
         if self.grid is None:
             return -0.2
         else:
             compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
-            data = json.dumps(self.grid.tolist())
-            voxel_in = gh.DataTree("RH_IN:voxel_json")
+            data = json.dumps({"voxels": self.grid.tolist()})
+            print(data)
+            voxel_in = gh.DataTree("voxel_json")
             voxel_in.Append([0], [data])
             cyclops_output = gh.EvaluateDefinition(self.cyclops_gh_file, [voxel_in])
+            print('cyclops_output: ', cyclops_output)
             karamba_output = gh.EvaluateDefinition(self.karamba_gh_file, [voxel_in])
-            print(karamba_output['values'][0]['InnerTree'])
-            cyclops_reward = self.weird_str_to_float(cyclops_output['values'][0]['InnerTree']['{0}'][0]['data'])
+            print('karamba output: ', karamba_output)
+            cyclops_reward = self.weird_str_to_float(cyclops_output['values'][0]['InnerTree']['{0;0}'][0]['data'])
             print('cyclops_reward: ',cyclops_reward)
             karamba_reward = self.weird_str_to_float(karamba_output['values'][0]['InnerTree']['{0}'][0]['data'])
             print('karamba reward: {}'.format(karamba_reward))
@@ -56,8 +60,7 @@ class VoxelEnv(Env):
     def reset(self, seed=None):
         super().reset(seed=seed)
         self.grid = np.zeros_like(self.grid, dtype=np.int32)
-        center = self.grid_size // 2
-        self.grid[center, center, center] = 1
+        self.grid[np.random.randint(0, self.grid_size), np.random.randint(0, self.grid_size), 0] = 1
         self._update_available_actions()
 
         observation = self.grid.flatten().astype(np.float32)  # Changed to float32
