@@ -1,27 +1,28 @@
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env
-from voxel_env import VoxelEnv, VectorizedVoxelEnv, export_voxel_grid
+from voxel_env import VoxelEnv, export_voxel_grid
 import torch
 import os
 import time
+import numpy as np
 
 # Check for GPU availability (for potential future CNN policies)
 gpu_available = torch.cuda.is_available()
 print(f"GPU available: {gpu_available}")
 print("Using CPU for PPO training (recommended for MLP policies)")
-num_env = 0
-port_list = [6500,6001,6002,6003]
+# num_env = 0
+# port_list = [6501,6001,6002,6003,6004,6005]
 # Create vectorized environment
 def make_env():
-    global num_env, port_list
-    env = VoxelEnv(port = port_list[num_env], grid_size=5, device='cpu')  # Use CPU for environments too
-    num_env+=1
+    # global num_env, port_list
+    env = VoxelEnv(port = 6501, grid_size=5, device='cpu')  # Use CPU for environments too
+    # num_env+=1
     return env
 
 # Use vectorized environment for better performance
-num_envs = 4  # Can use more envs on CPU since we're not GPU-limited
-env = make_vec_env(make_env, n_envs=num_envs, vec_env_cls=DummyVecEnv)
+num_envs = 1  # Can use more envs on CPU since we're not GPU-limited
+env = make_vec_env(make_env, n_envs=num_envs, vec_env_cls=DummyVecEnv, seed=np.random.randint(0,666))
 
 # Configure PPO with CPU (optimal for MLP policies)
 model = PPO(
@@ -51,7 +52,7 @@ model.save(f"ppo_voxel_model_{model_date_time}")
 
 # Post-training evaluation with single environment
 print("Starting evaluation...")
-eval_env = VoxelEnv(port=6500, grid_size=5, device='cpu')  # Use CPU for evaluation too
+eval_env = VoxelEnv(port=6501, grid_size=5, device='cpu')  # Use CPU for evaluation too
 output_folder = f"output_steps/model_{model_date_time}"
 os.makedirs(output_folder, exist_ok=True)
 

@@ -7,7 +7,6 @@ from gymnasium import Env, spaces
 import compute_rhino3d.Util
 import compute_rhino3d.Grasshopper as gh
 
-
 class VoxelEnv(Env):
     def __init__(self, port, grid_size=5, device=None):
         super(VoxelEnv, self).__init__()
@@ -23,21 +22,36 @@ class VoxelEnv(Env):
         )
 
         self.available_actions = []
+        self._update_available_actions()
         self.timeouts = 0
         self.port = port
-        self.gh_file = os.path.join(os.getcwd(),'gh_files','RL_Voxel_V4_hops.gh')
+        self.cyclops_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V4_hops.ghx')
+        self.cyclops_wt = 0.3
+        self.karamba_gh_file = os.path.join(os.getcwd(), 'gh_files', 'Karamba_hops.ghx' )
+        self.karamba_wt = 0.7
+    
+    def weird_str_to_float(self, input_string: str) -> float:
+        numeric_part = ''.join(char for char in input_string if char.isdigit() or char == '.')
+        return float(numeric_part)
 
     def get_reward_gh(self) -> float:
+        #TODO: this is not passing the voxels to rhino.compute it seems!
         if self.grid is None:
             return -0.2
         else:
             compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
+            data = json.dumps(self.grid.tolist())
             voxel_in = gh.DataTree("RH_IN:voxel_json")
-            voxel_in.Append([0], [json.dumps(self.grid.tolist())])
-            output = gh.EvaluateDefinition(self.gh_file, [voxel_in])
-            # print(output['values'][0]['InnerTree'])
-            reward = str(output['values'][0]['InnerTree']['{0;0}'][0]['data'])
-            return float(reward)
+            voxel_in.Append([0], [data])
+            cyclops_output = gh.EvaluateDefinition(self.cyclops_gh_file, [voxel_in])
+            karamba_output = gh.EvaluateDefinition(self.karamba_gh_file, [voxel_in])
+            print(karamba_output['values'][0]['InnerTree'])
+            cyclops_reward = self.weird_str_to_float(cyclops_output['values'][0]['InnerTree']['{0}'][0]['data'])
+            print('cyclops_reward: ',cyclops_reward)
+            karamba_reward = self.weird_str_to_float(karamba_output['values'][0]['InnerTree']['{0}'][0]['data'])
+            print('karamba reward: {}'.format(karamba_reward))
+            reward = self.cyclops_wt * cyclops_reward + self.karamba_wt * karamba_reward
+            return reward
 
     def reset(self, seed=None):
         super().reset(seed=seed)
