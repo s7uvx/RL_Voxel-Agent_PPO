@@ -1,1 +1,4 @@
-venv/
+.venv/
+.vscode/
+output_steps/
+output_steps_vec/
