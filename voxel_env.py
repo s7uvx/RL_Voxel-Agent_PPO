@@ -6,6 +6,7 @@ import time
 from gymnasium import Env, spaces
 import compute_rhino3d.Util
 import compute_rhino3d.Grasshopper as gh
+import gc
 
 class VoxelEnv(Env):
     def __init__(self, port, grid_size=5, device=None):
@@ -32,6 +33,7 @@ class VoxelEnv(Env):
         self.cyclops_wt = 0.3
         self.karamba_gh_file = os.path.join(os.getcwd(), 'gh_files', 'Karamba_hops.ghx' )
         self.karamba_wt = 0.7
+        compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
     
     def weird_str_to_float(self, input_string: str) -> float:
         numeric_part = ''.join(char for char in input_string if char.isdigit() or char == '.')
@@ -41,20 +43,35 @@ class VoxelEnv(Env):
         if self.grid is None:
             return -0.2
         else:
-            compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
+            
             data = json.dumps({"voxels": self.grid.tolist()})
-            print(data)
             voxel_in = gh.DataTree("voxel_json")
             voxel_in.Append([0], [data])
-            cyclops_output = gh.EvaluateDefinition(self.cyclops_gh_file, [voxel_in])
-            print('cyclops_output: ', cyclops_output)
-            karamba_output = gh.EvaluateDefinition(self.karamba_gh_file, [voxel_in])
-            print('karamba output: ', karamba_output)
-            cyclops_reward = self.weird_str_to_float(cyclops_output['values'][0]['InnerTree']['{0;0}'][0]['data'])
+            # blank = gh.DataTree("voxel_json")
+            # blank.Append([0], [])
+            try:
+                cyclops_output = gh.EvaluateDefinition(self.cyclops_gh_file, [voxel_in], )
+                cyclops_reward = self.weird_str_to_float(cyclops_output['values'][0]['InnerTree']['{0;0}'][0]['data'])
+                # gh.EvaluateDefinition(self.cyclops_gh_file, [blank])
+            except:
+                cyclops_reward = -0.2
+                print('error on cyclops')
+            try:
+                karamba_output = gh.EvaluateDefinition(self.karamba_gh_file, [voxel_in])
+                karamba_reward = self.weird_str_to_float(karamba_output['values'][0]['InnerTree']['{0}'][0]['data'])
+                # gh.EvaluateDefinition(self.karamba_gh_file, [blank])
+            except:
+                karamba_reward = -0.2
+                print('error on karamba')
+            
             print('cyclops_reward: ',cyclops_reward)
-            karamba_reward = self.weird_str_to_float(karamba_output['values'][0]['InnerTree']['{0}'][0]['data'])
+            
             print('karamba reward: {}'.format(karamba_reward))
-            reward = self.cyclops_wt * cyclops_reward + self.karamba_wt * karamba_reward
+            
+            
+            gc.collect()
+
+            reward = self.cyclops_wt * cyclops_reward# + self.karamba_wt * karamba_reward
             return reward
 
     def reset(self, seed=None):
