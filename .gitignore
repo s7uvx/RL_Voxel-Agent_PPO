@@ -2,3 +2,4 @@
 .vscode/
 output_steps/
 output_steps_vec/
+ppo_voxel_tensorboard/
