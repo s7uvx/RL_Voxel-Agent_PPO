@@ -17,17 +17,19 @@ dependencies = [
 
 [project.optional-dependencies]
 cpu = ["torch==2.7.0"]
+cu124 = ["torch==2.7.0"]
 cu126 = ["torch==2.7.0"]
 cu128 = ["torch==2.7.0"]
 
 [tool.uv]
-# The cpu and cu124 extras are mutually exclusive, you can't use both at the same time
-conflicts = [[{ extra = "cpu" }, { extra = "cu126" }, {extra = "cu128"}]]
+# The cpu and cuda extras are mutually exclusive, you can't use both at the same time
+conflicts = [[{ extra = "cpu" }, {extra = "cu124"}, { extra = "cu126" }, {extra = "cu128"}]]
 
 [tool.uv.sources]
-# The torch, torchvision, and torchaudio packages are installed from the pytorch-cpu and pytorch-cu124 indexes
+# The torch, torchvision, and torchaudio packages are installed from the pytorch-cpu and pytorch-cu126, cu128 indexes
 torch = [
   { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu124", extra = "cu124" },
   { index = "pytorch-cu126", extra = "cu126" },
   { index = "pytorch-cu128", extra = "cu128" },
   { path = "../../Users/cawn069856/Downloads/torch-2.7.0+cu128-cp312-cp312-win_amd64.whl" }
@@ -37,6 +39,11 @@ torch = [
 # The pytorch-cpu index is used to install the torch, torchvision, and torchaudio packages
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [[tool.uv.index]]

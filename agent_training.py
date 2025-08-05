@@ -16,14 +16,14 @@ print("Using CPU for PPO training (recommended for MLP policies)")
 # Create vectorized environment
 def make_env():
     # global num_env, port_list
-    env = VoxelEnv(port = 6501, grid_size=5, device='cpu')  # Use CPU for environments too
+    env = VoxelEnv(port = 81, grid_size=5, device='cpu')  # Use CPU for environments too
     # num_env+=1
     return env
 
 # Use vectorized environment for better performance
 num_envs = 1  # Can use more envs on CPU since we're not GPU-limited
 env = make_vec_env(make_env, n_envs=num_envs, vec_env_cls=DummyVecEnv, seed=np.random.randint(0,666))
-
+num_steps = 640
 # Configure PPO with CPU (optimal for MLP policies)
 model = PPO(
     "MlpPolicy",
@@ -31,7 +31,7 @@ model = PPO(
     verbose=1,
     learning_rate=0.0003,
     gamma=0.95,
-    n_steps=640,
+    n_steps=num_steps,
     batch_size=128,
     gae_lambda=0.9,
     ent_coef=0.1,
@@ -43,23 +43,23 @@ model = PPO(
 )
 
 print(f"Starting training with {num_envs} parallel environments on CPU...")
-model.learn(total_timesteps=2000, progress_bar=True)
+model.learn(total_timesteps=num_steps, progress_bar=True)
 print("Training completed")
 
 # Save the trained model
-model_date_time = time.strftime("%Y%m%d-%H",time.localtime())
+model_date_time = time.strftime("%Y%m%d-%H%M",time.localtime())
 model.save(f"ppo_voxel_model_{model_date_time}")
 
 # Post-training evaluation with single environment
 print("Starting evaluation...")
-eval_env = VoxelEnv(port=6501, grid_size=5, device='cpu')  # Use CPU for evaluation too
+eval_env = VoxelEnv(port=81, grid_size=5, device='cpu')  # Use CPU for evaluation too
 output_folder = f"output_steps/model_{model_date_time}"
 os.makedirs(output_folder, exist_ok=True)
 
 obs, info = eval_env.reset()
 
 print("Exporting voxel states for visualization...")
-for step in range(101):  # Reduced steps for faster evaluation
+for step in range(641):  # Reduced steps for faster evaluation
     action_idx, _states = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = eval_env.step(action_idx)
     done = terminated or truncated

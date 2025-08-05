@@ -1,4 +1,4 @@
-# Start Rhino Compute server on port 6501 - Auto-detect user and Hops version
+# Start Rhino Compute server on port 81 - Auto-detect user and Hops version
 
 # Get current username
 $username = $env:USERNAME
@@ -20,9 +20,9 @@ if (Test-Path $hopsBasePath) {
             Write-Host "  User: $username"
             Write-Host "  Hops Version: $latestHopsVersion"
             Write-Host "  Path: $rhinoComputePath"
-            Write-Host "  Port: 6501"
+            Write-Host "  Port: 81"
             
-            & $rhinoComputePath --port 6501
+            & $rhinoComputePath --port 81
         } else {
             Write-Error "Rhino Compute executable not found at: $rhinoComputePath"
         }
