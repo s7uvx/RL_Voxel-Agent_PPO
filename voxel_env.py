@@ -36,35 +36,7 @@ class VoxelEnv(Env):
         self.karamba_gh_file = os.path.join(os.getcwd(), 'gh_files', 'Karamba_hops.ghx' )
         self.karamba_wt = 0.7
         compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
-
-    # def get_reward_gh(self) -> float:
-    #     if self.grid is None:
-    #         return -0.2
-    #     else:
-            
-    #         data = json.dumps({"voxels": self.grid.tolist()})
-    #         voxel_in = gh.DataTree("voxel_json")
-    #         voxel_in.Append([0], [data])
-    #         try:
-    #             cyclops_output = gh.EvaluateDefinition(self.cyclops_gh_file, [voxel_in], )
-    #             cyclops_reward = self.weird_str_to_float(cyclops_output['values'][0]['InnerTree']['{0;0}'][0]['data'])
-    #         except:
-    #             cyclops_reward = -0.2
-    #             print('error on cyclops')
-    #         try:
-    #             karamba_output = gh.EvaluateDefinition(self.karamba_gh_file, [voxel_in])
-    #             karamba_reward = self.weird_str_to_float(karamba_output['values'][0]['InnerTree']['{0}'][0]['data'])
-    #         except:
-    #             karamba_reward = -0.2
-    #             print('error on karamba')
-            
-    #         print('cyclops_reward: ',cyclops_reward)
-    #         print('karamba reward: {}'.format(karamba_reward))
-            
-    #         gc.collect()
-
-    #         reward = self.cyclops_wt * cyclops_reward + self.karamba_wt * karamba_reward
-    #         return reward
+        self.epw_file = os.path.join(os.getcwd(), 'gh_files', 'ESP_Barcelona.081810_SWEC.epw')
 
     def reset(self, seed=None):
         super().reset(seed=seed)
@@ -173,7 +145,7 @@ class VoxelEnv(Env):
     def _calculate_reward(self, x, y, z):
         if self.grid[x, y, z] == 0:
             self.grid[x, y, z] = 1
-            reward = get_reward_gh(self.grid, self.cyclops_gh_file, self.karamba_gh_file, self.cyclops_wt, self.karamba_wt)
+            reward = get_reward_gh(self.grid, self.cyclops_gh_file, self.karamba_gh_file, self.cyclops_wt, self.karamba_wt, self.epw_file)
             return reward
             # self._write_grid_to_temp_file()
             # return self._wait_for_external_reward()

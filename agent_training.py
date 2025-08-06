@@ -23,7 +23,8 @@ def make_env():
 # Use vectorized environment for better performance
 num_envs = 1  # Can use more envs on CPU since we're not GPU-limited
 env = make_vec_env(make_env, n_envs=num_envs, vec_env_cls=DummyVecEnv, seed=np.random.randint(0,666))
-num_steps = 640
+num_steps = 74
+num_epochs = 10
 # Configure PPO with CPU (optimal for MLP policies)
 model = PPO(
     "MlpPolicy",
@@ -32,18 +33,20 @@ model = PPO(
     learning_rate=0.0003,
     gamma=0.95,
     n_steps=num_steps,
-    batch_size=128,
+    batch_size=37,
+    n_epochs=num_epochs,
     gae_lambda=0.9,
     ent_coef=0.1,
     vf_coef=0.4,
     max_grad_norm=0.5,
     clip_range=0.2,
+    stats_window_size=10,
     device='cpu',  # Explicitly use CPU for better MLP performance
     tensorboard_log="./ppo_voxel_tensorboard/"  # Add tensorboard logging
 )
 
 print(f"Starting training with {num_envs} parallel environments on CPU...")
-model.learn(total_timesteps=num_steps, progress_bar=True)
+model.learn(total_timesteps=num_steps*num_epochs, progress_bar=True)
 print("Training completed")
 
 # Save the trained model
