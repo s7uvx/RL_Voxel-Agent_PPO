@@ -34,6 +34,8 @@ class VoxelEnv(Env):
         self.merged_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V5_hops.ghx')
         compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
         self.epw_file = os.path.join(os.getcwd(), 'gh_files', 'ESP_Barcelona.081810_SWEC.epw')
+        self.sun_wt = 0.3
+        self.str_wt = 0.7
 
     def reset(self, seed=None):
         super().reset(seed=seed)
@@ -142,7 +144,7 @@ class VoxelEnv(Env):
     def _calculate_reward(self, x, y, z):
         if self.grid[x, y, z] == 0:
             self.grid[x, y, z] = 1
-            reward = get_reward_gh(self.grid, self.merged_gh_file, self.epw_file)
+            reward = get_reward_gh(self.grid, self.merged_gh_file, self.epw_file, self.sun_wt, self.str_wt)
             return reward
             # self._write_grid_to_temp_file()
             # return self._wait_for_external_reward()

@@ -1,5 +1,5 @@
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.env_util import make_vec_env
 from voxel_env import VoxelEnv, export_voxel_grid
 import torch
@@ -62,7 +62,7 @@ os.makedirs(output_folder, exist_ok=True)
 obs, info = eval_env.reset()
 
 print("Exporting voxel states for visualization...")
-for step in range(641):  # Reduced steps for faster evaluation
+for step in range(148):  # Reduced steps for faster evaluation
     action_idx, _states = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = eval_env.step(action_idx)
     done = terminated or truncated

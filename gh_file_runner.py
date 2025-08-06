@@ -9,7 +9,7 @@ def weird_str_to_float(input_string: str) -> float:
     except ValueError:
         return -0.2  # fallback in case of error
 
-def get_reward_gh(grid, merged_gh_file, epw_file) -> float:
+def get_reward_gh(grid, merged_gh_file, epw_file, sun_wt, str_wt) -> float:
     if grid is None:
         return -0.2
 
@@ -28,9 +28,12 @@ def get_reward_gh(grid, merged_gh_file, epw_file) -> float:
         output = gh.EvaluateDefinition(merged_gh_file, [epw_path, voxel_in])
 
         # Adjust the InnerTree path below based on your GH output
-        reward_str = output['values'][0]['InnerTree']['{0;0}'][0]['data']
-        reward = weird_str_to_float(reward_str)
-        print(f'[INFO] Reward from merged GH: {reward:.2f}')
+        cyclops_reward_str = output['values'][0]['InnerTree']['{0;0}'][0]['data']
+        karamba_reward_str = output['values'][1]['InnerTree']['{0}'][0]['data']
+        cyclops_reward = weird_str_to_float(cyclops_reward_str)
+        karamba_reward = weird_str_to_float(karamba_reward_str)
+        reward = sun_wt * cyclops_reward + str_wt * karamba_reward
+        print('cyclops reward {:.2f}, karamba reward {:.2f}, total reward {:.2f}'.format(sun_wt * cyclops_reward, str_wt * karamba_reward, reward))
     except Exception as e:
         print(f'[ERROR] Failed to evaluate GH definition: {e}')
         reward = -0.2
