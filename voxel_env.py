@@ -31,10 +31,7 @@ class VoxelEnv(Env):
         self._update_available_actions()
         self.timeouts = 0
         self.port = port
-        self.cyclops_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V4_hops.ghx')
-        self.cyclops_wt = 0.3
-        self.karamba_gh_file = os.path.join(os.getcwd(), 'gh_files', 'Karamba_hops.ghx' )
-        self.karamba_wt = 0.7
+        self.merged_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V5_hops.ghx')
         compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
         self.epw_file = os.path.join(os.getcwd(), 'gh_files', 'ESP_Barcelona.081810_SWEC.epw')
 
@@ -145,7 +142,7 @@ class VoxelEnv(Env):
     def _calculate_reward(self, x, y, z):
         if self.grid[x, y, z] == 0:
             self.grid[x, y, z] = 1
-            reward = get_reward_gh(self.grid, self.cyclops_gh_file, self.karamba_gh_file, self.cyclops_wt, self.karamba_wt, self.epw_file)
+            reward = get_reward_gh(self.grid, self.merged_gh_file, self.epw_file)
             return reward
             # self._write_grid_to_temp_file()
             # return self._wait_for_external_reward()
