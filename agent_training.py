@@ -26,32 +26,44 @@ env = make_vec_env(make_env, n_envs=num_envs, vec_env_cls=DummyVecEnv, seed=np.r
 num_steps = 74
 num_epochs = 10
 # Configure PPO with CPU (optimal for MLP policies)
-model = PPO(
-    "MlpPolicy",
-    env,
-    verbose=1,
-    learning_rate=0.0003,
-    gamma=0.95,
-    n_steps=num_steps,
-    batch_size=37,
-    n_epochs=num_epochs,
-    gae_lambda=0.9,
-    ent_coef=0.1,
-    vf_coef=0.4,
-    max_grad_norm=0.5,
-    clip_range=0.2,
-    stats_window_size=10,
-    device='cpu',  # Explicitly use CPU for better MLP performance
-    tensorboard_log="./ppo_voxel_tensorboard/"  # Add tensorboard logging
-)
 
-print(f"Starting training with {num_envs} parallel environments on CPU...")
-model.learn(total_timesteps=num_steps*num_epochs, progress_bar=True)
+starting_step = 0
+model_dir = os.path.join(os.getcwd(),'models','PPO')
+os.makedirs(model_dir, exist_ok = True)
+existing_models = os.listdir(model_dir)
+if len(existing_models) > 0:
+    latest_model = os.path.splitext(sorted(existing_models, key=lambda x: os.path.getmtime(os.path.join(model_dir, x)))[-1])[0]
+    model = PPO.load(os.path.join(model_dir,latest_model), env=env, device='cpu')
+    starting_step = model._total_timesteps
+else:
+    model = PPO(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        learning_rate=0.0003,
+        gamma=0.95,
+        n_steps=num_steps,
+        batch_size=37,
+        n_epochs=num_epochs,
+        gae_lambda=0.9,
+        ent_coef=0.1,
+        vf_coef=0.4,
+        max_grad_norm=0.5,
+        clip_range=0.2,
+        stats_window_size=10,
+        device='cpu',  # Explicitly use CPU for better MLP performance
+        tensorboard_log="./ppo_voxel_tensorboard/"  # Add tensorboard logging
+    )
+
+print(f"Starting training from {starting_step} with {num_envs} parallel environments on CPU...")
+
+new_steps = num_steps*num_epochs
+model.learn(total_timesteps=new_steps, progress_bar=True)
 print("Training completed")
 
 # Save the trained model
 model_date_time = time.strftime("%Y%m%d-%H%M",time.localtime())
-model.save(f"ppo_voxel_model_{model_date_time}")
+model.save(os.path.join(model_dir,f"ppo_voxel_model_{model_date_time}_{new_steps+starting_step}"))
 
 # Post-training evaluation with single environment
 print("Starting evaluation...")
@@ -78,5 +90,5 @@ for step in range(148):  # Reduced steps for faster evaluation
         obs, info = eval_env.reset()
 
 print(f"Exported voxel states to: {output_folder}")
-print(f"Model saved as: ppo_voxel_model.zip")
+print(f"Model saved as: {}".format(os.path.join(model_dir,f"ppo_voxel_model_{model_date_time}_{new_steps+starting_step}")))
 print(f"Tensorboard logs saved to: ./ppo_voxel_tensorboard/")
