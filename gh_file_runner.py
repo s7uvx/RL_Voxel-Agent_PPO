@@ -1,6 +1,7 @@
 import compute_rhino3d.Grasshopper as gh
 import json
 import gc
+import os
 
 def weird_str_to_float(input_string: str) -> float:
     numeric_part = ''.join(char for char in input_string if char.isdigit() or char == '.')
@@ -13,29 +14,38 @@ def get_reward_gh(grid, merged_gh_file, epw_file, sun_wt, str_wt) -> float:
     if grid is None:
         return -0.2
 
-    # Prepare voxel data
+    # ✅ Convert EPW path to forward slashes
+    epw_file = epw_file.replace("\\", "/")
+
+    # Prepare voxel grid as JSON
     data = json.dumps({"voxels": grid.tolist()})
     voxel_in = gh.DataTree("voxel_json")
     voxel_in.Append([0], [data])
 
-    # Prepare EPW path (if still needed)
-    epw_json = json.dumps(epw_file)
-    epw_path = gh.DataTree('epw_path')
-    epw_path.Append([0], [epw_json])
+    # Send EPW path to Hops
+    epw_path = gh.DataTree("epw_path")
+    epw_path.Append([0], [epw_file])
 
     try:
-        # Send both inputs to the merged GH definition
+        # Evaluate Grasshopper definition
         output = gh.EvaluateDefinition(merged_gh_file, [epw_path, voxel_in])
 
-        # Adjust the InnerTree path below based on your GH output
+        # Extract reward values
         cyclops_reward_str = output['values'][0]['InnerTree']['{0;0}'][0]['data']
         karamba_reward_str = output['values'][1]['InnerTree']['{0}'][0]['data']
+
+        # Parse to float
         cyclops_reward = weird_str_to_float(cyclops_reward_str)
         karamba_reward = weird_str_to_float(karamba_reward_str)
+
+        # Weighted reward
         reward = sun_wt * cyclops_reward + str_wt * karamba_reward
-        print('cyclops reward {:.2f}, karamba reward {:.2f}, total reward {:.2f}'.format(sun_wt * cyclops_reward, str_wt * karamba_reward, reward))
+
+        # ✅ Log reward summary only
+        print(f"[REWARD] Cyclops: {sun_wt * cyclops_reward:.2f}, Karamba: {str_wt * karamba_reward:.2f}, Total: {reward:.2f}")
+
     except Exception as e:
-        print(f'[ERROR] Failed to evaluate GH definition: {e}')
+        print(f"[ERROR] Failed to evaluate GH definition: {e}")
         reward = -0.2
 
     gc.collect()

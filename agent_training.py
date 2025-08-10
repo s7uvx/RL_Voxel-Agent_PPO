@@ -90,5 +90,4 @@ for step in range(148):  # Reduced steps for faster evaluation
         obs, info = eval_env.reset()
 
 print(f"Exported voxel states to: {output_folder}")
-print(f"Model saved as: {}".format(os.path.join(model_dir,f"ppo_voxel_model_{model_date_time}_{new_steps+starting_step}")))
 print(f"Tensorboard logs saved to: ./ppo_voxel_tensorboard/")

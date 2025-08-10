@@ -17,14 +17,13 @@ class VoxelEnv(Env):
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.grid = np.zeros((grid_size, grid_size, grid_size), dtype=np.int32)
 
-        #initialize the first voxel randomly in the center of the bottom
-        self.grid[np.random.randint(0,grid_size), np.random.randint(0,grid_size), 0] = 1
+        self.grid[np.random.randint(0, grid_size), np.random.randint(0, grid_size), 0] = 1
 
         self.action_space = spaces.Discrete(1)
         self.observation_space = spaces.Box(
             low=0, high=1,
             shape=(grid_size * grid_size * grid_size,),
-            dtype=np.float32  # Changed to float32 for better GPU compatibility
+            dtype=np.float32
         )
 
         self.available_actions = []
@@ -33,9 +32,19 @@ class VoxelEnv(Env):
         self.port = port
         self.merged_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V5_hops.ghx')
         compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
-        self.epw_file = os.path.join(os.getcwd(), 'gh_files', 'ESP_Barcelona.081810_SWEC.epw')
         self.sun_wt = 0.3
         self.str_wt = 0.7
+
+        self.epw_folder = os.path.join(os.getcwd(), 'gh_files', 'epw')
+        self.epw_files = [
+            os.path.join(self.epw_folder, f)
+            for f in os.listdir(self.epw_folder)
+            if f.lower().endswith(".epw")
+        ]
+        if not self.epw_files:
+            raise FileNotFoundError(f"No EPW files found in {self.epw_folder}")
+
+        self.current_epw = None  # Will be set during reset()
 
     def reset(self, seed=None):
         super().reset(seed=seed)
@@ -43,8 +52,14 @@ class VoxelEnv(Env):
         self.grid[np.random.randint(0, self.grid_size), np.random.randint(0, self.grid_size), 0] = 1
         self._update_available_actions()
 
-        observation = self.grid.flatten().astype(np.float32)  # Changed to float32
-        info = {}
+        # Select EPW file for this episode
+        self.current_epw = np.random.choice(self.epw_files)
+        normalized_epw = self.current_epw.replace("\\", "/")
+        print(f"[EPISODE] Using EPW file: {os.path.basename(normalized_epw)}")
+
+
+        observation = self.grid.flatten().astype(np.float32)
+        info = {"epw_file": os.path.basename(self.current_epw)}
         return observation, info
 
     def step(self, action_idx):
@@ -60,9 +75,9 @@ class VoxelEnv(Env):
             active_voxels >= 0.6 * total_voxels or len(self.available_actions) == 0
         )
         truncated = False
-        info = {}
+        info = {"epw_file": os.path.basename(self.current_epw)}
 
-        observation = self.grid.flatten().astype(np.float32)  # Changed to float32
+        observation = self.grid.flatten().astype(np.float32)
         self.action_space = spaces.Discrete(max(1, len(self.available_actions)))
 
         return observation, reward, terminated, truncated, info
@@ -71,83 +86,57 @@ class VoxelEnv(Env):
         print(self.grid)
 
     def _count_neighbors(self, x, y, z):
-        # Vectorized neighbor counting
         neighbor_offsets = np.array([
-            [1, 0, 0], [-1, 0, 0],   # x-axis neighbors
-            [0, 1, 0], [0, -1, 0],   # y-axis neighbors
-            [0, 0, 1], [0, 0, -1]    # z-axis neighbors
+            [1, 0, 0], [-1, 0, 0],
+            [0, 1, 0], [0, -1, 0],
+            [0, 0, 1], [0, 0, -1]
         ])
-        
-        # Calculate neighbor coordinates
         neighbor_coords = np.array([x, y, z]) + neighbor_offsets
-        
-        # Filter coordinates within grid bounds
         valid_mask = (
             (neighbor_coords[:, 0] >= 0) & (neighbor_coords[:, 0] < self.grid_size) &
             (neighbor_coords[:, 1] >= 0) & (neighbor_coords[:, 1] < self.grid_size) &
             (neighbor_coords[:, 2] >= 0) & (neighbor_coords[:, 2] < self.grid_size)
         )
         valid_neighbors = neighbor_coords[valid_mask]
-        
         if len(valid_neighbors) == 0:
             return 0
-        
-        # Count neighbors that have value 1
         neighbor_values = self.grid[valid_neighbors[:, 0], valid_neighbors[:, 1], valid_neighbors[:, 2]]
         return int(np.sum(neighbor_values == 1))
 
     def _update_available_actions(self):
-        # Vectorized approach using NumPy operations
-        # Find all occupied voxels (value = 1)
         occupied_coords = np.argwhere(self.grid == 1)
-        
         if len(occupied_coords) == 0:
             self.available_actions = []
             return
-        
-        # Define neighbor offsets for 6-connectivity (face neighbors only)
         neighbor_offsets = np.array([
-            [1, 0, 0], [-1, 0, 0],   # x-axis neighbors
-            [0, 1, 0], [0, -1, 0],   # y-axis neighbors
-            [0, 0, 1], [0, 0, -1]    # z-axis neighbors
+            [1, 0, 0], [-1, 0, 0],
+            [0, 1, 0], [0, -1, 0],
+            [0, 0, 1], [0, 0, -1]
         ])
-        
-        # Generate all potential neighbor positions
-        # Shape: (num_occupied, 6, 3) - for each occupied voxel, get 6 neighbors
         potential_neighbors = occupied_coords[:, np.newaxis, :] + neighbor_offsets[np.newaxis, :, :]
-        
-        # Reshape to (num_occupied * 6, 3) for easier processing
         potential_neighbors = potential_neighbors.reshape(-1, 3)
-        
-        # Filter out coordinates that are outside grid boundaries
         valid_mask = (
             (potential_neighbors[:, 0] >= 0) & (potential_neighbors[:, 0] < self.grid_size) &
             (potential_neighbors[:, 1] >= 0) & (potential_neighbors[:, 1] < self.grid_size) &
             (potential_neighbors[:, 2] >= 0) & (potential_neighbors[:, 2] < self.grid_size)
         )
         valid_neighbors = potential_neighbors[valid_mask]
-        
         if len(valid_neighbors) == 0:
             self.available_actions = []
             return
-        
-        # Check which of these valid positions are empty (value = 0)
-        # Use advanced indexing to check grid values at these positions
         grid_values = self.grid[valid_neighbors[:, 0], valid_neighbors[:, 1], valid_neighbors[:, 2]]
         empty_mask = (grid_values == 0)
         empty_neighbors = valid_neighbors[empty_mask]
-        
-        # Remove duplicates by converting to set of tuples, then back to list
         unique_positions = set(map(tuple, empty_neighbors))
         self.available_actions = list(unique_positions)
 
     def _calculate_reward(self, x, y, z):
         if self.grid[x, y, z] == 0:
             self.grid[x, y, z] = 1
-            reward = get_reward_gh(self.grid, self.merged_gh_file, self.epw_file, self.sun_wt, self.str_wt)
+
+            epw_path = self.current_epw  # Use EPW chosen at reset()
+            reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
             return reward
-            # self._write_grid_to_temp_file()
-            # return self._wait_for_external_reward()
         else:
             return -0.2
 
@@ -156,7 +145,6 @@ class VoxelEnv(Env):
 
     def _wait_for_external_reward(self, timeout=30):
         global timeouts
-
         reward_file = "temp_reward.json"
         start_time = time.time()
 
@@ -168,8 +156,7 @@ class VoxelEnv(Env):
                         if not content:
                             raise ValueError("Empty file")
                         data = json.loads(content)
-                    
-                    # ✅ Wait until file is unlocked before deleting
+
                     for _ in range(10):
                         try:
                             os.remove(reward_file)
@@ -190,22 +177,21 @@ class VoxelEnv(Env):
                     return 0.0
                 time.sleep(0.1)
 
+
 def export_voxel_grid(grid, filename):
     data = {"voxels": grid.tolist()}
     with open(filename, 'w') as f:
         json.dump(data, f)
 
+
 class VectorizedVoxelEnv:
-    """Vectorized wrapper for multiple VoxelEnv instances"""
     def __init__(self, num_envs=8, grid_size=5, device=None):
         self.num_envs = num_envs
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.envs = [VoxelEnv(grid_size=grid_size, device=self.device) for _ in range(num_envs)]
-        
-        # Use the action/observation space from the first env
+        self.envs = [VoxelEnv(port=6500 + i, grid_size=grid_size, device=self.device) for i in range(num_envs)]
         self.action_space = self.envs[0].action_space
         self.observation_space = self.envs[0].observation_space
-        
+
     def reset(self, seed=None):
         observations = []
         infos = []
@@ -215,14 +201,13 @@ class VectorizedVoxelEnv:
             observations.append(obs)
             infos.append(info)
         return np.array(observations, dtype=np.float32), infos
-    
+
     def step(self, actions):
         observations = []
         rewards = []
         terminated_list = []
         truncated_list = []
         infos = []
-        
         for env, action in zip(self.envs, actions):
             obs, reward, terminated, truncated, info = env.step(action)
             observations.append(obs)
@@ -230,13 +215,11 @@ class VectorizedVoxelEnv:
             terminated_list.append(terminated)
             truncated_list.append(truncated)
             infos.append(info)
-            
-        return (np.array(observations, dtype=np.float32), 
+        return (np.array(observations, dtype=np.float32),
                 np.array(rewards, dtype=np.float32),
                 np.array(terminated_list, dtype=bool),
                 np.array(truncated_list, dtype=bool),
                 infos)
-    
+
     def render(self):
-        # Render only the first environment
         self.envs[0].render()
