@@ -17,17 +17,23 @@ class VoxelEnv(Env):
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.grid = np.zeros((grid_size, grid_size, grid_size), dtype=np.int32)
 
-        self.grid[np.random.randint(0, grid_size), np.random.randint(0, grid_size), 0] = 1
+        # Place root voxel and remember it (cannot be deleted)
+        rx, ry = np.random.randint(0, grid_size, size=2)
+        self.root_voxel = (rx, ry, 0)
+        self.grid[rx, ry, 0] = 1
 
-        self.action_space = spaces.Discrete(1)
+        # Action/obs spaces
+        self.action_space = spaces.Discrete(1)  # will be reset dynamically
         self.observation_space = spaces.Box(
             low=0, high=1,
             shape=(grid_size * grid_size * grid_size,),
             dtype=np.float32
         )
 
+        # Actions are a list of tuples: ("add"|"del", x, y, z)
         self.available_actions = []
         self._update_available_actions()
+
         self.timeouts = 0
         self.port = port
         self.merged_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V5_hops.ghx')
@@ -44,43 +50,61 @@ class VoxelEnv(Env):
         if not self.epw_files:
             raise FileNotFoundError(f"No EPW files found in {self.epw_folder}")
 
-        self.current_epw = None  # Will be set during reset()
+        self.current_epw = None  # set during reset()
 
     def reset(self, seed=None):
         super().reset(seed=seed)
+        rng = np.random.default_rng(seed)
         self.grid = np.zeros_like(self.grid, dtype=np.int32)
-        self.grid[np.random.randint(0, self.grid_size), np.random.randint(0, self.grid_size), 0] = 1
+
+        # New root voxel each episode (cannot delete)
+        rx = rng.integers(0, self.grid_size)
+        ry = rng.integers(0, self.grid_size)
+        self.root_voxel = (int(rx), int(ry), 0)
+        self.grid[self.root_voxel] = 1
+
         self._update_available_actions()
 
-        # Select EPW file for this episode
+        # Pick EPW for this episode
         self.current_epw = np.random.choice(self.epw_files)
         normalized_epw = self.current_epw.replace("\\", "/")
         print(f"[EPISODE] Using EPW file: {os.path.basename(normalized_epw)}")
-
 
         observation = self.grid.flatten().astype(np.float32)
         info = {"epw_file": os.path.basename(self.current_epw)}
         return observation, info
 
     def step(self, action_idx):
-        x, y, z = self.available_actions[action_idx]
-        reward = self._calculate_reward(x, y, z)
+        # Decode action
+        op, x, y, z = self.available_actions[action_idx]
 
+        # Log the action
+        print(f"[STEP] Action: {op.upper()} voxel at ({x}, {y}, {z})")
+
+        # Execute
+        if op == "add":
+            reward = self._add_voxel(x, y, z)
+        elif op == "del":
+            reward = self._delete_voxel(x, y, z)
+        else:
+            reward = -0.2  # safety fallback
+
+        # Refresh actions and dynamic action space
         self._update_available_actions()
+        self.action_space = spaces.Discrete(max(1, len(self.available_actions)))
 
+        # Episode termination logic
         total_voxels = self.grid_size ** 3
-        active_voxels = np.sum(self.grid)
-
+        active_voxels = int(np.sum(self.grid))
         terminated = bool(
             active_voxels >= 0.6 * total_voxels or len(self.available_actions) == 0
         )
         truncated = False
-        info = {"epw_file": os.path.basename(self.current_epw)}
 
         observation = self.grid.flatten().astype(np.float32)
-        self.action_space = spaces.Discrete(max(1, len(self.available_actions)))
-
+        info = {"epw_file": os.path.basename(self.current_epw)}
         return observation, reward, terminated, truncated, info
+
 
     def render(self):
         print(self.grid)
@@ -104,16 +128,20 @@ class VoxelEnv(Env):
         return int(np.sum(neighbor_values == 1))
 
     def _update_available_actions(self):
-        occupied_coords = np.argwhere(self.grid == 1)
-        if len(occupied_coords) == 0:
-            self.available_actions = []
+        """Builds a combined list of add + delete actions."""
+        occupied = np.argwhere(self.grid == 1)
+        self.available_actions = []
+
+        if len(occupied) == 0:
             return
+
+        # --- ADD actions: empty neighbors of the current shape ---
         neighbor_offsets = np.array([
             [1, 0, 0], [-1, 0, 0],
             [0, 1, 0], [0, -1, 0],
             [0, 0, 1], [0, 0, -1]
         ])
-        potential_neighbors = occupied_coords[:, np.newaxis, :] + neighbor_offsets[np.newaxis, :, :]
+        potential_neighbors = occupied[:, None, :] + neighbor_offsets[None, :, :]
         potential_neighbors = potential_neighbors.reshape(-1, 3)
         valid_mask = (
             (potential_neighbors[:, 0] >= 0) & (potential_neighbors[:, 0] < self.grid_size) &
@@ -121,25 +149,47 @@ class VoxelEnv(Env):
             (potential_neighbors[:, 2] >= 0) & (potential_neighbors[:, 2] < self.grid_size)
         )
         valid_neighbors = potential_neighbors[valid_mask]
-        if len(valid_neighbors) == 0:
-            self.available_actions = []
-            return
-        grid_values = self.grid[valid_neighbors[:, 0], valid_neighbors[:, 1], valid_neighbors[:, 2]]
-        empty_mask = (grid_values == 0)
-        empty_neighbors = valid_neighbors[empty_mask]
-        unique_positions = set(map(tuple, empty_neighbors))
-        self.available_actions = list(unique_positions)
+        if len(valid_neighbors) > 0:
+            grid_values = self.grid[valid_neighbors[:, 0], valid_neighbors[:, 1], valid_neighbors[:, 2]]
+            empty_mask = (grid_values == 0)
+            empty_neighbors = valid_neighbors[empty_mask]
+            for x, y, z in set(map(tuple, empty_neighbors)):
+                self.available_actions.append(("add", int(x), int(y), int(z)))
 
-    def _calculate_reward(self, x, y, z):
+        # --- DELETE actions: any occupied voxel except the root voxel ---
+        root = self.root_voxel
+        for x, y, z in map(tuple, occupied):
+            if (x, y, z) != root:
+                self.available_actions.append(("del", int(x), int(y), int(z)))
+
+        # Keep a deterministic order (optional but helps reproducibility)
+        self.available_actions.sort(key=lambda a: (a[0], a[1], a[2], a[3]))
+
+    def _add_voxel(self, x, y, z):
         if self.grid[x, y, z] == 0:
             self.grid[x, y, z] = 1
-
-            epw_path = self.current_epw  # Use EPW chosen at reset()
+            epw_path = self.current_epw
             reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
             return reward
         else:
+            return -0.2  # invalid add
+
+    def _delete_voxel(self, x, y, z):
+        # Prevent deleting the root voxel
+        if (x, y, z) == self.root_voxel:
             return -0.2
 
+        if self.grid[x, y, z] == 1:
+            self.grid[x, y, z] = 0
+            epw_path = self.current_epw
+            reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
+            # Optional: add a small penalty to discourage excessive churn
+            # reward -= 0.01
+            return reward
+        else:
+            return -0.2  # invalid delete
+
+    # (unchanged helpers below kept for completeness)
     def _write_grid_to_temp_file(self):
         export_voxel_grid(self.grid, "temp_voxel_input.json")
 
@@ -147,7 +197,6 @@ class VoxelEnv(Env):
         global timeouts
         reward_file = "temp_reward.json"
         start_time = time.time()
-
         while True:
             if os.path.exists(reward_file):
                 try:
@@ -156,26 +205,23 @@ class VoxelEnv(Env):
                         if not content:
                             raise ValueError("Empty file")
                         data = json.loads(content)
-
                     for _ in range(10):
                         try:
                             os.remove(reward_file)
                             break
                         except PermissionError:
                             time.sleep(0.03)
-
                     return float(data.get("reward", 0.0))
-
                 except (json.JSONDecodeError, ValueError) as e:
                     print(f"⏳ Waiting for valid reward file... ({e})")
                     time.sleep(0.1)
-
             else:
                 if time.time() - start_time > timeout:
                     self.timeouts += 1
                     print("❌ Timeout: No external reward received. {} times".format(self.timeouts))
                     return 0.0
                 time.sleep(0.1)
+
 
 
 def export_voxel_grid(grid, filename):
