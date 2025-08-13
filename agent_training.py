@@ -31,7 +31,7 @@ def make_env():
 num_envs = 1  # Can use more envs on CPU since we're not GPU-limited
 env = make_vec_env(make_env, n_envs=num_envs, vec_env_cls=DummyVecEnv, seed=np.random.randint(0,666))
 num_steps = 74
-num_epochs = 1000
+num_epochs = 100
 # Configure PPO with CPU (optimal for MLP policies)
 
 starting_step = 0
@@ -50,7 +50,7 @@ else:
         learning_rate=0.0003,
         gamma=0.95,
         n_steps=num_steps,
-        batch_size=1,
+        batch_size=37,
         n_epochs=num_epochs,
         gae_lambda=0.9,
         ent_coef=0.1,
