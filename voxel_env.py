@@ -22,17 +22,18 @@ class VoxelEnv(Env):
         self.root_voxel = (rx, ry, 0)
         self.grid[rx, ry, 0] = 1
 
-        # Action/obs spaces
-        self.action_space = spaces.Discrete(1)  # will be reset dynamically
+        # Expanded action space: 2 actions * (grid_size^3) locations
+        # Action = action_type * grid_size^3 + location_index
+        # action_type: 0=Add, 1=Delete
+        # location_index: 0 to (grid_size^3 - 1)
+        total_locations = grid_size ** 3
+        self.action_space = spaces.Discrete(2 * total_locations)
+        
         self.observation_space = spaces.Box(
             low=0, high=1,
             shape=(grid_size * grid_size * grid_size,),
             dtype=np.float32
         )
-
-        # Actions are a list of tuples: ("add"|"del", x, y, z)
-        self.available_actions = []
-        self._update_available_actions()
 
         self.timeouts = 0
         self.port = port
@@ -50,7 +51,27 @@ class VoxelEnv(Env):
         if not self.epw_files:
             raise FileNotFoundError(f"No EPW files found in {self.epw_folder}")
 
-        self.current_epw = None  # set during reset()
+        self.current_epw = None
+
+    def _action_to_coords(self, action_idx):
+        """Convert action index to action type and 3D coordinates"""
+        total_locations = self.grid_size ** 3
+        
+        if action_idx < total_locations:
+            # Add action (0 to grid_size^3 - 1)
+            action_type = "add"
+            location_idx = action_idx
+        else:
+            # Delete action (grid_size^3 to 2*grid_size^3 - 1)
+            action_type = "delete"
+            location_idx = action_idx - total_locations
+        
+        # Convert location index to 3D coordinates
+        z = location_idx // (self.grid_size ** 2)
+        y = (location_idx % (self.grid_size ** 2)) // self.grid_size
+        x = location_idx % self.grid_size
+        
+        return action_type, (x, y, z)
 
     def reset(self, seed=None):
         super().reset(seed=seed)
@@ -63,8 +84,6 @@ class VoxelEnv(Env):
         self.root_voxel = (int(rx), int(ry), 0)
         self.grid[self.root_voxel] = 1
 
-        self._update_available_actions()
-
         # Pick EPW for this episode
         self.current_epw = np.random.choice(self.epw_files)
         normalized_epw = self.current_epw.replace("\\", "/")
@@ -75,125 +94,112 @@ class VoxelEnv(Env):
         return observation, info
 
     def step(self, action_idx):
-        # Decode action
-        op, x, y, z = self.available_actions[action_idx]
-
-        # Log the action
-        print(f"[STEP] Action: {op.upper()} voxel at ({x}, {y}, {z})")
-
-        # Execute
-        if op == "add":
+        action_type, (x, y, z) = self._action_to_coords(action_idx)
+        
+        if action_type == "add":
             reward = self._add_voxel(x, y, z)
-        elif op == "del":
+            if reward > -0.1:  # Successful
+                print(f"[STEP] ✅ ADD at ({x},{y},{z}) - SUCCESS")
+            else:  # Failed
+                print(f"[STEP] ❌ ADD at ({x},{y},{z}) - FAILED (reward: {reward})")
+        elif action_type == "delete":
             reward = self._delete_voxel(x, y, z)
+            if reward > -0.1:  # Successful
+                print(f"[STEP] ✅ DELETE at ({x},{y},{z}) - SUCCESS")
+            else:  # Failed
+                print(f"[STEP] ❌ DELETE at ({x},{y},{z}) - FAILED (reward: {reward})")
         else:
-            reward = -0.2  # safety fallback
-
-        # Refresh actions and dynamic action space
-        self._update_available_actions()
-        self.action_space = spaces.Discrete(max(1, len(self.available_actions)))
+            reward = -0.5
+            print(f"[STEP] ❌ INVALID action index: {action_idx}")
 
         # Episode termination logic
         total_voxels = self.grid_size ** 3
         active_voxels = int(np.sum(self.grid))
-        terminated = bool(
-            active_voxels >= 0.6 * total_voxels or len(self.available_actions) == 0
-        )
+        terminated = bool(active_voxels >= 0.6 * total_voxels or active_voxels <= 1)
         truncated = False
 
         observation = self.grid.flatten().astype(np.float32)
         info = {"epw_file": os.path.basename(self.current_epw)}
         return observation, reward, terminated, truncated, info
 
+    def _add_voxel(self, x, y, z):
+        """Add a voxel at specific coordinates with validation"""
+        # Check if coordinates are valid
+        if not (0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size):
+            return -0.5  # Invalid coordinates
+        
+        # Check if location is already occupied
+        if self.grid[x, y, z] == 1:
+            return -0.3  # Already occupied
+        
+        # Check if location is adjacent to existing structure (connectivity rule)
+        if not self._is_adjacent_to_structure(x, y, z):
+            return -0.4  # Not connected to existing structure
+        
+        print(f"[ADD] Adding voxel at ({x}, {y}, {z})")
+        self.grid[x, y, z] = 1
+        
+        # Get reward from Grasshopper
+        epw_path = self.current_epw
+        reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
+        return reward
+
+    def _delete_voxel(self, x, y, z):
+        """Delete a voxel at specific coordinates with validation"""
+        # Check if coordinates are valid
+        if not (0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size):
+            return -0.5  # Invalid coordinates
+        
+        # Check if location is occupied
+        if self.grid[x, y, z] == 0:
+            return -0.3  # Nothing to delete
+        
+        # Check if it's the root voxel (cannot delete)
+        if (x, y, z) == self.root_voxel:
+            return -0.4  # Cannot delete root voxel
+        
+        print(f"[DELETE] Removing voxel at ({x}, {y}, {z})")
+        self.grid[x, y, z] = 0
+        
+        # Get reward from Grasshopper
+        epw_path = self.current_epw
+        reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
+        return reward
+
+    def _is_adjacent_to_structure(self, x, y, z):
+        """Check if position (x,y,z) is adjacent to existing structure"""
+        neighbor_offsets = [
+            (1, 0, 0), (-1, 0, 0),
+            (0, 1, 0), (0, -1, 0),
+            (0, 0, 1), (0, 0, -1)
+        ]
+        
+        for dx, dy, dz in neighbor_offsets:
+            nx, ny, nz = x + dx, y + dy, z + dz
+            if (0 <= nx < self.grid_size and 
+                0 <= ny < self.grid_size and 
+                0 <= nz < self.grid_size):
+                if self.grid[nx, ny, nz] == 1:
+                    return True
+        return False
+
+    # Remove the old random methods
+    def _add_random_voxel(self):
+        """DEPRECATED: Use _add_voxel instead"""
+        pass
+
+    def _delete_random_voxel(self):
+        """DEPRECATED: Use _delete_voxel instead"""
+        pass
 
     def render(self):
         print(self.grid)
 
-    def _count_neighbors(self, x, y, z):
-        neighbor_offsets = np.array([
-            [1, 0, 0], [-1, 0, 0],
-            [0, 1, 0], [0, -1, 0],
-            [0, 0, 1], [0, 0, -1]
-        ])
-        neighbor_coords = np.array([x, y, z]) + neighbor_offsets
-        valid_mask = (
-            (neighbor_coords[:, 0] >= 0) & (neighbor_coords[:, 0] < self.grid_size) &
-            (neighbor_coords[:, 1] >= 0) & (neighbor_coords[:, 1] < self.grid_size) &
-            (neighbor_coords[:, 2] >= 0) & (neighbor_coords[:, 2] < self.grid_size)
-        )
-        valid_neighbors = neighbor_coords[valid_mask]
-        if len(valid_neighbors) == 0:
-            return 0
-        neighbor_values = self.grid[valid_neighbors[:, 0], valid_neighbors[:, 1], valid_neighbors[:, 2]]
-        return int(np.sum(neighbor_values == 1))
-
-    def _update_available_actions(self):
-        """Builds a combined list of add + delete actions."""
-        occupied = np.argwhere(self.grid == 1)
-        self.available_actions = []
-
-        if len(occupied) == 0:
-            return
-
-        # --- ADD actions: empty neighbors of the current shape ---
-        neighbor_offsets = np.array([
-            [1, 0, 0], [-1, 0, 0],
-            [0, 1, 0], [0, -1, 0],
-            [0, 0, 1], [0, 0, -1]
-        ])
-        potential_neighbors = occupied[:, None, :] + neighbor_offsets[None, :, :]
-        potential_neighbors = potential_neighbors.reshape(-1, 3)
-        valid_mask = (
-            (potential_neighbors[:, 0] >= 0) & (potential_neighbors[:, 0] < self.grid_size) &
-            (potential_neighbors[:, 1] >= 0) & (potential_neighbors[:, 1] < self.grid_size) &
-            (potential_neighbors[:, 2] >= 0) & (potential_neighbors[:, 2] < self.grid_size)
-        )
-        valid_neighbors = potential_neighbors[valid_mask]
-        if len(valid_neighbors) > 0:
-            grid_values = self.grid[valid_neighbors[:, 0], valid_neighbors[:, 1], valid_neighbors[:, 2]]
-            empty_mask = (grid_values == 0)
-            empty_neighbors = valid_neighbors[empty_mask]
-            for x, y, z in set(map(tuple, empty_neighbors)):
-                self.available_actions.append(("add", int(x), int(y), int(z)))
-
-        # --- DELETE actions: any occupied voxel except the root voxel ---
-        root = self.root_voxel
-        for x, y, z in map(tuple, occupied):
-            if (x, y, z) != root:
-                self.available_actions.append(("del", int(x), int(y), int(z)))
-
-        # Keep a deterministic order (optional but helps reproducibility)
-        self.available_actions.sort(key=lambda a: (a[0], a[1], a[2], a[3]))
-
-    def _add_voxel(self, x, y, z):
-        if self.grid[x, y, z] == 0:
-            self.grid[x, y, z] = 1
-            epw_path = self.current_epw
-            reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
-            return reward
-        else:
-            return -0.2  # invalid add
-
-    def _delete_voxel(self, x, y, z):
-        # Prevent deleting the root voxel
-        if (x, y, z) == self.root_voxel:
-            return -0.2
-
-        if self.grid[x, y, z] == 1:
-            self.grid[x, y, z] = 0
-            epw_path = self.current_epw
-            reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
-            # Optional: add a small penalty to discourage excessive churn
-            # reward -= 0.01
-            return reward
-        else:
-            return -0.2  # invalid delete
-
-    # (unchanged helpers below kept for completeness)
     def _write_grid_to_temp_file(self):
         export_voxel_grid(self.grid, "temp_voxel_input.json")
 
     def _wait_for_external_reward(self, timeout=30):
+        # Keep this method for compatibility if needed elsewhere
         global timeouts
         reward_file = "temp_reward.json"
         start_time = time.time()
@@ -221,7 +227,6 @@ class VoxelEnv(Env):
                     print("❌ Timeout: No external reward received. {} times".format(self.timeouts))
                     return 0.0
                 time.sleep(0.1)
-
 
 
 def export_voxel_grid(grid, filename):

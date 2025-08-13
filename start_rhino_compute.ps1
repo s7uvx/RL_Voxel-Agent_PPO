@@ -1,4 +1,4 @@
-# Start Rhino Compute server on port 81 - Auto-detect user and Hops version
+# Start Rhino Compute server on port 6501 - Auto-detect user and Hops version
 
 # Get current username
 $username = $env:USERNAME
