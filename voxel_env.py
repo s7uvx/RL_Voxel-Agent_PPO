@@ -10,8 +10,9 @@ import gc
 
 from gh_file_runner import get_reward_gh
 
+
 class VoxelEnv(Env):
-    def __init__(self, port, grid_size=5, device=None):
+    def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=3, step_penalty=0.0):
         super(VoxelEnv, self).__init__()
         self.grid_size = grid_size
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -23,9 +24,6 @@ class VoxelEnv(Env):
         self.grid[rx, ry, 0] = 1
 
         # Expanded action space: 2 actions * (grid_size^3) locations
-        # Action = action_type * grid_size^3 + location_index
-        # action_type: 0=Add, 1=Delete
-        # location_index: 0 to (grid_size^3 - 1)
         total_locations = grid_size ** 3
         self.action_space = spaces.Discrete(2 * total_locations)
         
@@ -34,6 +32,14 @@ class VoxelEnv(Env):
             shape=(grid_size * grid_size * grid_size,),
             dtype=np.float32
         )
+
+        # Episode/time-limit + anti-churn
+        self.max_steps = max_steps
+        self.step_count = 0
+        self.cooldown_steps = cooldown_steps
+        self._added_cooldown = {}    # forbid DELETE here for N steps
+        self._deleted_cooldown = {}  # forbid ADD here for N steps
+        self.step_penalty = step_penalty  # tiny cost per step (optional)
 
         self.timeouts = 0
         self.port = port
@@ -53,30 +59,71 @@ class VoxelEnv(Env):
 
         self.current_epw = None
 
+    # ---------------------------
+    # NEW: action masking support
+    # ---------------------------
+    def action_masks(self) -> np.ndarray:
+        """
+        Boolean mask of shape (2 * grid_size**3,)
+        True = allowed, False = masked (invalid).
+        """
+        total_locations = self.grid_size ** 3
+        mask = np.zeros(2 * total_locations, dtype=bool)
+
+        def idx_to_coords(location_idx):
+            z = location_idx // (self.grid_size ** 2)
+            y = (location_idx % (self.grid_size ** 2)) // self.grid_size
+            x = location_idx % self.grid_size
+            return x, y, z
+
+        # ADD actions in [0, total_locations)
+        for loc in range(total_locations):
+            x, y, z = idx_to_coords(loc)
+            valid_add = (
+                self.grid[x, y, z] == 0
+                and self._is_adjacent_to_structure(x, y, z)
+                and (x, y, z) not in self._deleted_cooldown  # anti ping-pong
+            )
+            mask[loc] = valid_add
+
+        # DELETE actions in [total_locations, 2*total_locations)
+        for loc in range(total_locations):
+            x, y, z = idx_to_coords(loc)
+            valid_del = (
+                self.grid[x, y, z] == 1
+                and (x, y, z) != self.root_voxel
+                and (x, y, z) not in self._added_cooldown   # anti ping-pong
+            )
+            mask[total_locations + loc] = valid_del
+
+        return mask
+
     def _action_to_coords(self, action_idx):
         """Convert action index to action type and 3D coordinates"""
         total_locations = self.grid_size ** 3
         
         if action_idx < total_locations:
-            # Add action (0 to grid_size^3 - 1)
             action_type = "add"
             location_idx = action_idx
         else:
-            # Delete action (grid_size^3 to 2*grid_size^3 - 1)
             action_type = "delete"
             location_idx = action_idx - total_locations
         
-        # Convert location index to 3D coordinates
         z = location_idx // (self.grid_size ** 2)
         y = (location_idx % (self.grid_size ** 2)) // self.grid_size
         x = location_idx % self.grid_size
         
         return action_type, (x, y, z)
 
-    def reset(self, seed=None):
+    def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         rng = np.random.default_rng(seed)
         self.grid = np.zeros_like(self.grid, dtype=np.int32)
+
+        # Episode bookkeeping
+        self.step_count = 0
+        self._added_cooldown.clear()
+        self._deleted_cooldown.clear()
 
         # New root voxel each episode (cannot delete)
         rx = rng.integers(0, self.grid_size)
@@ -87,83 +134,109 @@ class VoxelEnv(Env):
         # Pick EPW for this episode
         self.current_epw = np.random.choice(self.epw_files)
         normalized_epw = self.current_epw.replace("\\", "/")
-        print(f"[EPISODE] Using EPW file: {os.path.basename(normalized_epw)}")
+        print(f"[EPISODE] Using EPW file: {os.path.basename(normalized_epw)}", flush=True)
 
         observation = self.grid.flatten().astype(np.float32)
-        info = {"epw_file": os.path.basename(self.current_epw)}
+        info = {
+            "epw_file": os.path.basename(self.current_epw),
+            "action_masks": self.action_masks(),
+        }
         return observation, info
 
+    def _tick_cooldowns(self):
+        # decrement, then purge zeros
+        for d in (self._added_cooldown, self._deleted_cooldown):
+            for k in list(d.keys()):
+                d[k] -= 1
+                if d[k] <= 0:
+                    del d[k]
+
     def step(self, action_idx):
+        # Time/bookkeeping
+        self.step_count += 1
+        self._tick_cooldowns()  # age cooldowns at each step
+
+        # (optional) guard: if caller ignored masks and picked invalid, we still handle it safely
         action_type, (x, y, z) = self._action_to_coords(action_idx)
         
+        base_reward = 0.0
         if action_type == "add":
-            reward = self._add_voxel(x, y, z)
-            if reward > -0.1:  # Successful
-                print(f"[STEP] ✅ ADD at ({x},{y},{z}) - SUCCESS")
-            else:  # Failed
-                print(f"[STEP] ❌ ADD at ({x},{y},{z}) - FAILED (reward: {reward})")
+            base_reward = self._add_voxel(x, y, z)
+            msg = "ADD"
         elif action_type == "delete":
-            reward = self._delete_voxel(x, y, z)
-            if reward > -0.1:  # Successful
-                print(f"[STEP] ✅ DELETE at ({x},{y},{z}) - SUCCESS")
-            else:  # Failed
-                print(f"[STEP] ❌ DELETE at ({x},{y},{z}) - FAILED (reward: {reward})")
+            base_reward = self._delete_voxel(x, y, z)
+            msg = "DELETE"
         else:
-            reward = -0.5
-            print(f"[STEP] ❌ INVALID action index: {action_idx}")
+            base_reward = -0.5
+            msg = "INVALID"
+
+        # Optional per-step penalty to discourage churn
+        reward = float(base_reward) - float(self.step_penalty)
+
+        if reward > -0.1 and msg in ("ADD", "DELETE"):
+            print(f"[STEP] ✅ {msg} at ({x},{y},{z}) - SUCCESS")
+        else:
+            print(f"[STEP] ❌ {msg} at ({x},{y},{z}) - FAILED (reward: {reward})")
 
         # Episode termination logic
         total_voxels = self.grid_size ** 3
         active_voxels = int(np.sum(self.grid))
         terminated = bool(active_voxels >= 0.6 * total_voxels or active_voxels <= 1)
-        truncated = False
+
+        # also terminate if no valid actions remain (all masked)
+        no_actions_left = not np.any(self.action_masks())
+        terminated = bool(terminated or no_actions_left)
+
+        # Time-limit truncation
+        truncated = self.step_count >= self.max_steps
 
         observation = self.grid.flatten().astype(np.float32)
-        info = {"epw_file": os.path.basename(self.current_epw)}
+        info = {
+            "epw_file": os.path.basename(self.current_epw),
+            "action_masks": self.action_masks()  # keep mask up to date every step
+        }
         return observation, reward, terminated, truncated, info
 
     def _add_voxel(self, x, y, z):
         """Add a voxel at specific coordinates with validation"""
-        # Check if coordinates are valid
         if not (0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size):
             return -0.5  # Invalid coordinates
-        
-        # Check if location is already occupied
         if self.grid[x, y, z] == 1:
             return -0.3  # Already occupied
-        
-        # Check if location is adjacent to existing structure (connectivity rule)
         if not self._is_adjacent_to_structure(x, y, z):
             return -0.4  # Not connected to existing structure
         
         print(f"[ADD] Adding voxel at ({x}, {y}, {z})")
         self.grid[x, y, z] = 1
+
+        # start cooldown: forbid deleting this cell for a few steps
+        if self.cooldown_steps > 0:
+            self._added_cooldown[(x, y, z)] = self.cooldown_steps
+            self._deleted_cooldown.pop((x, y, z), None)
         
         # Get reward from Grasshopper
-        epw_path = self.current_epw
-        reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
+        reward = get_reward_gh(self.grid, self.merged_gh_file, self.current_epw, self.sun_wt, self.str_wt)
         return reward
 
     def _delete_voxel(self, x, y, z):
         """Delete a voxel at specific coordinates with validation"""
-        # Check if coordinates are valid
         if not (0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size):
             return -0.5  # Invalid coordinates
-        
-        # Check if location is occupied
         if self.grid[x, y, z] == 0:
             return -0.3  # Nothing to delete
-        
-        # Check if it's the root voxel (cannot delete)
         if (x, y, z) == self.root_voxel:
             return -0.4  # Cannot delete root voxel
         
         print(f"[DELETE] Removing voxel at ({x}, {y}, {z})")
         self.grid[x, y, z] = 0
+
+        # start cooldown: forbid adding this cell back for a few steps
+        if self.cooldown_steps > 0:
+            self._deleted_cooldown[(x, y, z)] = self.cooldown_steps
+            self._added_cooldown.pop((x, y, z), None)
         
         # Get reward from Grasshopper
-        epw_path = self.current_epw
-        reward = get_reward_gh(self.grid, self.merged_gh_file, epw_path, self.sun_wt, self.str_wt)
+        reward = get_reward_gh(self.grid, self.merged_gh_file, self.current_epw, self.sun_wt, self.str_wt)
         return reward
 
     def _is_adjacent_to_structure(self, x, y, z):
@@ -239,6 +312,7 @@ class VectorizedVoxelEnv:
     def __init__(self, num_envs=8, grid_size=5, device=None):
         self.num_envs = num_envs
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
+        # default params of VoxelEnv (max_steps/cooldown/penalty) are fine here
         self.envs = [VoxelEnv(port=6500 + i, grid_size=grid_size, device=self.device) for i in range(num_envs)]
         self.action_space = self.envs[0].action_space
         self.observation_space = self.envs[0].observation_space
