@@ -11,6 +11,7 @@ from sb3_contrib.common.maskable.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import CheckpointCallback
 from gymnasium import wrappers
 
 from voxel_env import VoxelEnv, export_voxel_grid
@@ -23,6 +24,7 @@ parser.add_argument('--port', type=int, default=81, help='Base port number for V
 parser.add_argument('--new', action='store_true', default=False, help='Start a new model instead of loading an existing one')
 parser.add_argument('--n_envs', type=int, default=1, help='Number of parallel environments (default: 1)')
 parser.add_argument('--grid', type=int, default=5, help='Grid size (default: 5)')
+parser.add_argument('--chk_freq', type=int, default=100, help='Frequency of saving checkpoints (defulat: 100)')
 args = parser.parse_args()
 
 # ---------------------------
@@ -95,14 +97,24 @@ else:
 print(f"Starting training from {starting_step} with {num_envs} parallel env(s) on CPU...")
 
 new_steps = num_steps * num_epochs
-model.learn(total_timesteps=new_steps, progress_bar=True)
+model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
+save_path = os.path.join(model_dir, f"maskable_ppo_voxel_{model_date_time}_{new_steps+starting_step}")
+
+# Create checkpoint callback to save model every 100 steps
+checkpoint_callback = CheckpointCallback(
+    save_freq=args.chk_freq,  # Save every 100 steps
+    save_path=os.path.join(model_dir, 'checkpoints'),
+    name_prefix=f"maskable_ppo_voxel_{model_date_time}_{new_steps+starting_step}"
+)
+
+
+model.learn(total_timesteps=new_steps, progress_bar=True, callback=checkpoint_callback)
 print("Training completed")
 
 # ---------------------------
 # Save the trained model
 # ---------------------------
-model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
-save_path = os.path.join(model_dir, f"maskable_ppo_voxel_{model_date_time}_{new_steps+starting_step}")
+
 model.save(save_path)
 print(f"Model saved as: {save_path}.zip")
 
