@@ -59,8 +59,8 @@ env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
 # ---------------------------
 # PPO hyperparams
 # ---------------------------
-num_steps = 74
-num_epochs = 100
+num_steps = 125
+num_epochs = 5
 # Configure PPO with CPU (optimal for MLP policies)
 
 starting_step = 0
@@ -124,16 +124,16 @@ print(f"Model saved as: {save_path}.zip")
 print("Starting evaluation...")
 
 # Wrap a single eval env with ActionMasker so predict/eval sees masks
-eval_env = DummyVecEnv([make_single_env(0)])
+# eval_env = DummyVecEnv([make_single_env(0)])
 
 # quick eval using mask-aware evaluate_policy
-mean_rew, std_rew = evaluate_policy(model, eval_env, n_eval_episodes=3, deterministic=True)
-print(f"Eval reward: mean={mean_rew:.3f} ± {std_rew:.3f}")
-
+# mean_rew, std_rew = evaluate_policy(model, eval_env, n_eval_episodes=1, deterministic=True)
+# print(f"Eval reward: mean={mean_rew:.3f} ± {std_rew:.3f}")
+max_eval_steps=3*num_steps
 # manual rollout for exporting grids
 raw_eval_env: VoxelEnv = VoxelEnv(port=args.port, grid_size=args.grid, device='cpu')
 raw_eval_env = ActionMasker(raw_eval_env, mask_fn)  # ensure masks are applied at predict-time
-raw_eval_env = wrappers.TimeLimit(env=raw_eval_env, max_episode_steps=148)
+raw_eval_env = wrappers.TimeLimit(env=raw_eval_env, max_episode_steps=max_eval_steps*2)
 raw_eval_env = Monitor(raw_eval_env, allow_early_resets=True)
 
 
@@ -142,8 +142,8 @@ os.makedirs(output_folder, exist_ok=True)
 
 obs, info = raw_eval_env.reset()
 print("Exporting voxel states for visualization...")
-for step in range(148):
-    action_idx, _states = model.predict(obs, deterministic=True)
+for step in range(max_eval_steps):
+    action_idx, _states = model.predict(obs, deterministic=True, action_masks=info['action_masks'])
     obs, reward, terminated, truncated, info = raw_eval_env.step(action_idx)
     done = bool(terminated or truncated)
 
