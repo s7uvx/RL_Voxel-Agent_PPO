@@ -12,6 +12,16 @@ from gh_file_runner import get_reward_gh
 
 
 class VoxelEnv(Env):
+    """
+    Voxel placement environment with action masking and a safety NO-OP action.
+
+    Actions:
+        0 .. (N-1):           ADD voxel at linearized location
+        N .. (2N-1):          DELETE voxel at linearized location
+        2N (NOOP_IDX):        NO-OP (always legal, small penalty)
+
+    Where N = grid_size ** 3
+    """
     def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=3, step_penalty=0.0):
         super(VoxelEnv, self).__init__()
         self.grid_size = grid_size
@@ -23,10 +33,12 @@ class VoxelEnv(Env):
         self.root_voxel = (rx, ry, 0)
         self.grid[rx, ry, 0] = 1
 
-        # Expanded action space: 2 actions * (grid_size^3) locations
+        # Action space with NO-OP
         total_locations = grid_size ** 3
-        self.action_space = spaces.Discrete(2 * total_locations)
-        
+        self.total_locations = total_locations
+        self.NOOP_IDX = 2 * total_locations
+        self.action_space = spaces.Discrete(self.NOOP_IDX + 1)
+
         self.observation_space = spaces.Box(
             low=0, high=1,
             shape=(grid_size * grid_size * grid_size,),
@@ -60,25 +72,32 @@ class VoxelEnv(Env):
         self.current_epw = None
 
     # ---------------------------
-    # NEW: action masking support
+    # Utilities
+    # ---------------------------
+    def _idx_to_coords(self, location_idx):
+        z = location_idx // (self.grid_size ** 2)
+        y = (location_idx % (self.grid_size ** 2)) // self.grid_size
+        x = location_idx % self.grid_size
+        return x, y, z
+
+    def _coords_to_idx(self, x, y, z):
+        return x + y * self.grid_size + z * (self.grid_size ** 2)
+
+    # ---------------------------
+    # Action masking support
     # ---------------------------
     def action_masks(self) -> np.ndarray:
         """
-        Boolean mask of shape (2 * grid_size**3,)
+        Boolean mask of shape (2 * grid_size**3 + 1,)
         True = allowed, False = masked (invalid).
+        Last index (NOOP_IDX) is always True.
         """
-        total_locations = self.grid_size ** 3
-        mask = np.zeros(2 * total_locations, dtype=bool)
-
-        def idx_to_coords(location_idx):
-            z = location_idx // (self.grid_size ** 2)
-            y = (location_idx % (self.grid_size ** 2)) // self.grid_size
-            x = location_idx % self.grid_size
-            return x, y, z
+        total_locations = self.total_locations
+        mask = np.zeros(self.NOOP_IDX + 1, dtype=bool)
 
         # ADD actions in [0, total_locations)
         for loc in range(total_locations):
-            x, y, z = idx_to_coords(loc)
+            x, y, z = self._idx_to_coords(loc)
             valid_add = (
                 self.grid[x, y, z] == 0
                 and self._is_adjacent_to_structure(x, y, z)
@@ -88,31 +107,39 @@ class VoxelEnv(Env):
 
         # DELETE actions in [total_locations, 2*total_locations)
         for loc in range(total_locations):
-            x, y, z = idx_to_coords(loc)
+            x, y, z = self._idx_to_coords(loc)
             valid_del = (
                 self.grid[x, y, z] == 1
                 and (x, y, z) != self.root_voxel
                 and (x, y, z) not in self._added_cooldown   # anti ping-pong
             )
+            if valid_del:
+                # Connectivity-aware masking: simulate delete; only allow if structure stays connected
+                self.grid[x, y, z] = 0
+                still_connected = self._is_structure_connected()
+                self.grid[x, y, z] = 1
+                valid_del = still_connected
+
             mask[total_locations + loc] = valid_del
 
+        # Always allow NO-OP
+        mask[self.NOOP_IDX] = True
         return mask
 
     def _action_to_coords(self, action_idx):
         """Convert action index to action type and 3D coordinates"""
-        total_locations = self.grid_size ** 3
-        
+        if action_idx == self.NOOP_IDX:
+            return "noop", (None, None, None)
+
+        total_locations = self.total_locations
         if action_idx < total_locations:
             action_type = "add"
             location_idx = action_idx
         else:
             action_type = "delete"
             location_idx = action_idx - total_locations
-        
-        z = location_idx // (self.grid_size ** 2)
-        y = (location_idx % (self.grid_size ** 2)) // self.grid_size
-        x = location_idx % self.grid_size
-        
+
+        x, y, z = self._idx_to_coords(location_idx)
         return action_type, (x, y, z)
 
     def reset(self, seed=None, options=None):
@@ -134,7 +161,7 @@ class VoxelEnv(Env):
         # Pick EPW for this episode
         self.current_epw = np.random.choice(self.epw_files)
         normalized_epw = self.current_epw.replace("\\", "/")
-        print(f"[EPISODE] Using EPW file: {os.path.basename(normalized_epw)}", flush=True)
+        print(f"[EPISODE] ☀️ Using EPW file: {os.path.basename(normalized_epw)}", flush=True)
 
         observation = self.grid.flatten().astype(np.float32)
         info = {
@@ -156,16 +183,21 @@ class VoxelEnv(Env):
         self.step_count += 1
         self._tick_cooldowns()  # age cooldowns at each step
 
-        # (optional) guard: if caller ignored masks and picked invalid, we still handle it safely
         action_type, (x, y, z) = self._action_to_coords(action_idx)
-        
         base_reward = 0.0
-        if action_type == "add":
+
+        if action_type == "noop":
+            base_reward = -0.01  # small penalty so it's used only when truly blocked
+            msg = "NOOP"
+
+        elif action_type == "add":
             base_reward = self._add_voxel(x, y, z)
             msg = "ADD"
+
         elif action_type == "delete":
             base_reward = self._delete_voxel(x, y, z)
             msg = "DELETE"
+
         else:
             base_reward = -0.5
             msg = "INVALID"
@@ -173,19 +205,22 @@ class VoxelEnv(Env):
         # Optional per-step penalty to discourage churn
         reward = float(base_reward) - float(self.step_penalty)
 
-        if reward > -0.1 and msg in ("ADD", "DELETE"):
-            print(f"[STEP] ✅ {msg} at ({x},{y},{z}) - SUCCESS")
+        if reward > -0.1 and msg in ("ADD"):
+            print(f"[STEP] ➕ {msg} at ({x},{y},{z}) - SUCCESS")
+        elif reward > -0.1 and msg in ("DELETE"):
+            print(f"[STEP] ➖ {msg} at ({x},{y},{z}) - SUCCESS")
         else:
-            print(f"[STEP] ❌ {msg} at ({x},{y},{z}) - FAILED (reward: {reward})")
+            print(f"[STEP] ❌ {msg} at ({x},{y},{z}) - RESULT (reward: {reward})")
 
         # Episode termination logic
         total_voxels = self.grid_size ** 3
         active_voxels = int(np.sum(self.grid))
         terminated = bool(active_voxels >= 0.6 * total_voxels or active_voxels <= 1)
 
-        # also terminate if no valid actions remain (all masked)
-        no_actions_left = not np.any(self.action_masks())
-        terminated = bool(terminated or no_actions_left)
+        # Terminate if only NO-OP remains (no adds/deletes possible)
+        mask_now = self.action_masks()
+        no_real_actions = not np.any(mask_now[:self.NOOP_IDX])
+        terminated = bool(terminated or no_real_actions)
 
         # Time-limit truncation
         truncated = self.step_count >= self.max_steps
@@ -197,6 +232,16 @@ class VoxelEnv(Env):
         }
         return observation, reward, terminated, truncated, info
 
+    def _safe_reward(self, r):
+        """Coerce reward to finite float; fallback on invalid values."""
+        try:
+            r = float(r)
+        except Exception:
+            return -1.0
+        if not np.isfinite(r):
+            return -1.0
+        return r
+
     def _add_voxel(self, x, y, z):
         """Add a voxel at specific coordinates with validation"""
         if not (0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size):
@@ -205,7 +250,7 @@ class VoxelEnv(Env):
             return -0.3  # Already occupied
         if not self._is_adjacent_to_structure(x, y, z):
             return -0.4  # Not connected to existing structure
-        
+
         print(f"[ADD] Adding voxel at ({x}, {y}, {z})")
         self.grid[x, y, z] = 1
 
@@ -213,31 +258,37 @@ class VoxelEnv(Env):
         if self.cooldown_steps > 0:
             self._added_cooldown[(x, y, z)] = self.cooldown_steps
             self._deleted_cooldown.pop((x, y, z), None)
-        
+
         # Get reward from Grasshopper
         reward = get_reward_gh(self.grid, self.merged_gh_file, self.current_epw, self.sun_wt, self.str_wt)
-        return reward
+        return self._safe_reward(reward)
 
     def _delete_voxel(self, x, y, z):
-        """Delete a voxel at specific coordinates with validation"""
+        """Delete a voxel at specific coordinates with connectivity validation"""
         if not (0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size):
             return -0.5  # Invalid coordinates
         if self.grid[x, y, z] == 0:
             return -0.3  # Nothing to delete
         if (x, y, z) == self.root_voxel:
             return -0.4  # Cannot delete root voxel
-        
-        print(f"[DELETE] Removing voxel at ({x}, {y}, {z})")
+
+        # Tentative delete with connectivity check
         self.grid[x, y, z] = 0
+        if not self._is_structure_connected():
+            # revert if it disconnects the structure
+            self.grid[x, y, z] = 1
+            return -0.4
+
+        print(f"[DELETE] Removing voxel at ({x}, {y}, {z})")
 
         # start cooldown: forbid adding this cell back for a few steps
         if self.cooldown_steps > 0:
             self._deleted_cooldown[(x, y, z)] = self.cooldown_steps
             self._added_cooldown.pop((x, y, z), None)
-        
+
         # Get reward from Grasshopper
         reward = get_reward_gh(self.grid, self.merged_gh_file, self.current_epw, self.sun_wt, self.str_wt)
-        return reward
+        return self._safe_reward(reward)
 
     def _is_adjacent_to_structure(self, x, y, z):
         """Check if position (x,y,z) is adjacent to existing structure"""
@@ -246,17 +297,50 @@ class VoxelEnv(Env):
             (0, 1, 0), (0, -1, 0),
             (0, 0, 1), (0, 0, -1)
         ]
-        
         for dx, dy, dz in neighbor_offsets:
             nx, ny, nz = x + dx, y + dy, z + dz
-            if (0 <= nx < self.grid_size and 
-                0 <= ny < self.grid_size and 
+            if (0 <= nx < self.grid_size and
+                0 <= ny < self.grid_size and
                 0 <= nz < self.grid_size):
                 if self.grid[nx, ny, nz] == 1:
                     return True
         return False
 
-    # Remove the old random methods
+    def _is_structure_connected(self):
+        """
+        BFS from root over voxels==1; returns True iff all active voxels are reachable.
+        """
+        from collections import deque
+
+        rx, ry, rz = self.root_voxel
+        if self.grid[rx, ry, rz] == 0:
+            return False
+
+        total_active = int(self.grid.sum())
+        visited = set()
+        q = deque([self.root_voxel])
+        visited.add(self.root_voxel)
+
+        neighbor_offsets = [
+            (1, 0, 0), (-1, 0, 0),
+            (0, 1, 0), (0, -1, 0),
+            (0, 0, 1), (0, 0, -1)
+        ]
+
+        while q:
+            x, y, z = q.popleft()
+            for dx, dy, dz in neighbor_offsets:
+                nx, ny, nz = x + dx, y + dy, z + dz
+                if (0 <= nx < self.grid_size and
+                    0 <= ny < self.grid_size and
+                    0 <= nz < self.grid_size):
+                    if self.grid[nx, ny, nz] == 1 and (nx, ny, nz) not in visited:
+                        visited.add((nx, ny, nz))
+                        q.append((nx, ny, nz))
+
+        return len(visited) == total_active
+
+    # Deprecated random methods kept for compatibility
     def _add_random_voxel(self):
         """DEPRECATED: Use _add_voxel instead"""
         pass
@@ -309,10 +393,14 @@ def export_voxel_grid(grid, filename):
 
 
 class VectorizedVoxelEnv:
+    """
+    Simple Python-side vectorized wrapper (not a SB3 VecEnv).
+    Kept for convenience; agent_training.py uses DummyVecEnv.
+    """
     def __init__(self, num_envs=8, grid_size=5, device=None):
         self.num_envs = num_envs
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
-        # default params of VoxelEnv (max_steps/cooldown/penalty) are fine here
+        # default params of VoxelEnv are fine here
         self.envs = [VoxelEnv(port=6500 + i, grid_size=grid_size, device=self.device) for i in range(num_envs)]
         self.action_space = self.envs[0].action_space
         self.observation_space = self.envs[0].observation_space
