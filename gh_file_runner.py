@@ -2,6 +2,7 @@ import compute_rhino3d.Grasshopper as gh
 import json
 import gc
 import os
+import numpy as np
 
 def weird_str_to_float(input_string: str) -> float:
     numeric_part = ''.join(char for char in input_string if char.isdigit() or char == '.')
@@ -10,7 +11,19 @@ def weird_str_to_float(input_string: str) -> float:
     except ValueError:
         return -0.2  # fallback in case of error
 
-def get_reward_gh(grid, merged_gh_file, epw_file, sun_wt=0.3, str_wt=0.5, cst_wt=0.1, wst_wt=0.1) -> float:
+def get_reward_gh(
+    grid,
+    merged_gh_file,
+    epw_file,
+    sun_wt: float = 0.3,
+    str_wt: float = 0.5,
+    cst_wt: float = 0.1,
+    wst_wt: float = 0.1,
+    *,
+    repulsors: list | None = None,
+    repulsor_wt: float = 0.0,
+    repulsor_radius: float = 2.0,
+) -> float:
     if grid is None:
         return -0.2
 
@@ -18,9 +31,9 @@ def get_reward_gh(grid, merged_gh_file, epw_file, sun_wt=0.3, str_wt=0.5, cst_wt
     epw_file = epw_file.replace("\\", "/")
 
     # Prepare voxel grid as JSON
-    data = json.dumps({"voxels": grid.tolist()})
+    voxel_grid = json.dumps({"voxels": grid.tolist()})
     voxel_in = gh.DataTree("voxel_json")
-    voxel_in.Append([0], [data])
+    voxel_in.Append([0], [voxel_grid])
 
     # Send EPW path to Hops
     epw_path = gh.DataTree("epw_path")
@@ -41,14 +54,45 @@ def get_reward_gh(grid, merged_gh_file, epw_file, sun_wt=0.3, str_wt=0.5, cst_wt
     panel_cost_reward = weird_str_to_float(panel_cost_reward_str)
     panel_waste_reward = weird_str_to_float(panel_waste_reward_str)
 
-    # Weighted reward
-    reward = sun_wt * cyclops_reward + \
-        str_wt * karamba_reward + \
-        cst_wt * panel_cost_reward + \
-        wst_wt * panel_waste_reward
+    # Weighted reward from Grasshopper
+    reward = (
+        sun_wt * cyclops_reward
+        + str_wt * karamba_reward
+        + cst_wt * panel_cost_reward
+        + wst_wt * panel_waste_reward
+    )
+
+    # Optional repulsor proximity penalty (0..repulsor_wt)
+    repulsor_penalty = 0.0
+    try:
+        if repulsor_wt > 0 and repulsors:
+            rep_arr = np.asarray(repulsors, dtype=float)
+            if rep_arr.ndim == 1:
+                rep_arr = rep_arr.reshape(1, -1)
+            occ = np.argwhere(np.asarray(grid) == 1)
+            if occ.size > 0 and rep_arr.size > 0:
+                # pairwise distances (n_voxels x n_repulsors)
+                diff = occ[:, None, :] - rep_arr[None, :, :]
+                dists = np.linalg.norm(diff, axis=2)
+                # linear falloff to 0 at radius
+                with np.errstate(invalid='ignore'):
+                    p = 1.0 - (dists / max(1e-6, float(repulsor_radius)))
+                p = np.clip(p, 0.0, 1.0)
+                proximity = float(p.mean())  # normalized 0..1
+                repulsor_penalty = repulsor_wt * proximity
+                reward -= repulsor_penalty
+    except Exception as e:
+        # Be robust: never break training due to repulsor math
+        repulsor_penalty = 0.0
 
     # ✅ Log reward summary only
-    print(f"[REWARD] Cyclops: {sun_wt * cyclops_reward:.2f}, Karamba: {str_wt * karamba_reward:.2f}, Cost: {cst_wt * panel_cost_reward:.2f}, Waste: {wst_wt * panel_waste_reward:.2f} - Total: {reward:.2f}")
+    print(
+        f"[REWARD] Cyclops: {sun_wt * cyclops_reward:.2f}, "
+        f"Karamba: {str_wt * karamba_reward:.2f}, "
+        f"Cost: {cst_wt * panel_cost_reward:.2f}, "
+        f"Waste: {wst_wt * panel_waste_reward:.2f}, "
+        f"Repulsor: -{repulsor_penalty:.2f} - Total: {reward:.2f}"
+    )
 
     # except Exception as e:
     #     print(f"[ERROR] Failed to evaluate GH definition: {e}")

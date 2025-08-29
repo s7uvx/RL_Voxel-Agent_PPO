@@ -7,6 +7,7 @@ from gymnasium import Env, spaces
 import compute_rhino3d.Util
 import compute_rhino3d.Grasshopper as gh
 import gc
+from typing import Deque, Tuple, cast, Callable, Iterable, Sequence, Optional
 
 from gh_file_runner import get_reward_gh
 
@@ -20,28 +21,45 @@ class VoxelEnv(Env):
         N .. (2N-1):          DELETE voxel at linearized location
         2N (NOOP_IDX):        NO-OP (always legal, small penalty)
 
-    Where N = grid_size ** 3
+    Where N = gx * gy * gz (grid_size if int, or product of a 3D tuple)
     """
-    def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=3, step_penalty=0.0):
+    def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=3, step_penalty=0.0,
+                 num_repulsors: int = 3, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
+                 repulsor_provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]] = None):
         super(VoxelEnv, self).__init__()
-        self.grid_size = grid_size
+        # Normalize grid_size to 3D dims (gx, gy, gz)
+        if isinstance(grid_size, (list, tuple, np.ndarray)):
+            dims = [int(v) for v in grid_size]
+            if len(dims) == 1:
+                dims = [dims[0], dims[0], dims[0]]
+            if len(dims) != 3:
+                raise ValueError("grid_size must be an int or a 3-sequence of ints")
+            gx, gy, gz = dims
+        else:
+            gx = gy = gz = int(grid_size)
+
+        if gx <= 0 or gy <= 0 or gz <= 0:
+            raise ValueError("grid dimensions must be positive")
+
+        self.gx, self.gy, self.gz = int(gx), int(gy), int(gz)
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.grid = np.zeros((grid_size, grid_size, grid_size), dtype=np.int32)
+        self.grid = np.zeros((self.gx, self.gy, self.gz), dtype=np.int32)
 
         # Place root voxel and remember it (cannot be deleted)
-        rx, ry = np.random.randint(0, grid_size, size=2)
+        rx = np.random.randint(0, self.gx)
+        ry = np.random.randint(0, self.gy)
         self.root_voxel = (rx, ry, 0)
         self.grid[rx, ry, 0] = 1
 
         # Action space with NO-OP
-        total_locations = grid_size ** 3
+        total_locations = int(self.gx * self.gy * self.gz)
         self.total_locations = total_locations
         self.NOOP_IDX = 2 * total_locations
         self.action_space = spaces.Discrete(self.NOOP_IDX + 1)
 
         self.observation_space = spaces.Box(
             low=0, high=1,
-            shape=(grid_size * grid_size * grid_size,),
+            shape=(total_locations,),
             dtype=np.float32
         )
 
@@ -59,6 +77,11 @@ class VoxelEnv(Env):
         compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
         self.sun_wt = 0.3
         self.str_wt = 0.7
+        # Repulsor config
+        self.num_repulsors = num_repulsors
+        self.repulsor_wt = repulsor_wt
+        self.repulsor_radius = repulsor_radius
+        self.repulsor_provider = repulsor_provider
 
         self.epw_folder = os.path.join(os.getcwd(), 'gh_files', 'epw')
         self.epw_files = [
@@ -70,25 +93,28 @@ class VoxelEnv(Env):
             raise FileNotFoundError(f"No EPW files found in {self.epw_folder}")
 
         self.current_epw = None
+        self.repulsors = []
 
     # ---------------------------
     # Utilities
     # ---------------------------
     def _idx_to_coords(self, location_idx):
-        z = location_idx // (self.grid_size ** 2)
-        y = (location_idx % (self.grid_size ** 2)) // self.grid_size
-        x = location_idx % self.grid_size
+        area = self.gx * self.gy
+        z = location_idx // area
+        rem = location_idx % area
+        y = rem // self.gx
+        x = rem % self.gx
         return x, y, z
 
     def _coords_to_idx(self, x, y, z):
-        return x + y * self.grid_size + z * (self.grid_size ** 2)
+        return int(x + y * self.gx + z * (self.gx * self.gy))
 
     # ---------------------------
     # Action masking support
     # ---------------------------
     def action_masks(self) -> np.ndarray:
         """
-        Boolean mask of shape (2 * grid_size**3 + 1,)
+        Boolean mask of shape (2 * total_locations + 1,)
         True = allowed, False = masked (invalid).
         Last index (NOOP_IDX) is always True.
         """
@@ -153,10 +179,40 @@ class VoxelEnv(Env):
         self._deleted_cooldown.clear()
 
         # New root voxel each episode (cannot delete)
-        rx = rng.integers(0, self.grid_size)
-        ry = rng.integers(0, self.grid_size)
+        rx = rng.integers(0, self.gx)
+        ry = rng.integers(0, self.gy)
         self.root_voxel = (int(rx), int(ry), 0)
         self.grid[self.root_voxel] = 1
+
+        # Generate per-episode repulsor points (use hook if provided; else random)
+        self.repulsors = []
+        def _random_repulsors() -> list[list[int]]:
+            pts: list[list[int]] = []
+            for _ in range(max(0, int(self.num_repulsors))):
+                rx = int(rng.integers(0, self.gx))
+                ry = int(rng.integers(0, self.gy))
+                rz = int(rng.integers(0, self.gz))
+                pts.append([rx, ry, rz])
+            return pts
+
+        if self.repulsor_provider is not None:
+            try:
+                provided = list(self.repulsor_provider(self, rng))  # expect iterable of 3D points
+                arr = np.asarray(provided, dtype=float)
+                if arr.ndim == 1:
+                    arr = arr.reshape(1, -1)
+                if arr.size == 0 or arr.shape[1] < 3:
+                    raise ValueError("Repulsor provider must yield points with at least 3 coordinates")
+                coords = np.rint(arr[:, :3]).astype(int)
+                coords[:, 0] = np.clip(coords[:, 0], 0, self.gx - 1)
+                coords[:, 1] = np.clip(coords[:, 1], 0, self.gy - 1)
+                coords[:, 2] = np.clip(coords[:, 2], 0, self.gz - 1)
+                self.repulsors = coords.tolist()[: max(0, int(self.num_repulsors))]
+            except Exception:
+                # Fallback to random on any provider error
+                self.repulsors = _random_repulsors()
+        else:
+            self.repulsors = _random_repulsors()
 
         # Pick EPW for this episode
         self.current_epw = np.random.choice(self.epw_files)
@@ -165,10 +221,19 @@ class VoxelEnv(Env):
 
         observation = self.grid.flatten().astype(np.float32)
         info = {
-            "epw_file": os.path.basename(self.current_epw),
+            "epw_file": os.path.basename(self.current_epw or ""),
             "action_masks": self.action_masks(),
+            "repulsors": np.array(self.repulsors, dtype=np.int32) if self.repulsors else np.empty((0,3), dtype=np.int32),
         }
         return observation, info
+
+    def set_repulsor_provider(self, provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]]):
+        """Install or clear a per-episode repulsor provider hook.
+
+        provider(env, rng) -> iterable of 3D points (x, y, z) in grid index space.
+        If None, random repulsors will be used.
+        """
+        self.repulsor_provider = provider
 
     def _tick_cooldowns(self):
         # decrement, then purge zeros
@@ -213,7 +278,7 @@ class VoxelEnv(Env):
             print(f"[STEP] ❌ {msg} at ({x},{y},{z}) - RESULT (reward: {reward})")
 
         # Episode termination logic
-        total_voxels = self.grid_size ** 3
+        total_voxels = self.total_locations
         active_voxels = int(np.sum(self.grid))
         terminated = bool(active_voxels >= 0.6 * total_voxels or active_voxels <= 1)
 
@@ -227,7 +292,7 @@ class VoxelEnv(Env):
 
         observation = self.grid.flatten().astype(np.float32)
         info = {
-            "epw_file": os.path.basename(self.current_epw),
+            "epw_file": os.path.basename(self.current_epw or ""),
             "action_masks": self.action_masks()  # keep mask up to date every step
         }
         return observation, reward, terminated, truncated, info
@@ -244,7 +309,7 @@ class VoxelEnv(Env):
 
     def _add_voxel(self, x, y, z):
         """Add a voxel at specific coordinates with validation"""
-        if not (0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size):
+        if not (0 <= x < self.gx and 0 <= y < self.gy and 0 <= z < self.gz):
             return -0.5  # Invalid coordinates
         if self.grid[x, y, z] == 1:
             return -0.3  # Already occupied
@@ -260,12 +325,21 @@ class VoxelEnv(Env):
             self._deleted_cooldown.pop((x, y, z), None)
 
         # Get reward from Grasshopper
-        reward = get_reward_gh(self.grid, self.merged_gh_file, self.current_epw, self.sun_wt, self.str_wt)
+        reward = get_reward_gh(
+            self.grid,
+            self.merged_gh_file,
+            self.current_epw,
+            self.sun_wt,
+            self.str_wt,
+            repulsors=self.repulsors,
+            repulsor_wt=self.repulsor_wt,
+            repulsor_radius=self.repulsor_radius,
+        )
         return self._safe_reward(reward)
 
     def _delete_voxel(self, x, y, z):
         """Delete a voxel at specific coordinates with connectivity validation"""
-        if not (0 <= x < self.grid_size and 0 <= y < self.grid_size and 0 <= z < self.grid_size):
+        if not (0 <= x < self.gx and 0 <= y < self.gy and 0 <= z < self.gz):
             return -0.5  # Invalid coordinates
         if self.grid[x, y, z] == 0:
             return -0.3  # Nothing to delete
@@ -287,7 +361,16 @@ class VoxelEnv(Env):
             self._added_cooldown.pop((x, y, z), None)
 
         # Get reward from Grasshopper
-        reward = get_reward_gh(self.grid, self.merged_gh_file, self.current_epw, self.sun_wt, self.str_wt)
+        reward = get_reward_gh(
+            self.grid,
+            self.merged_gh_file,
+            self.current_epw,
+            self.sun_wt,
+            self.str_wt,
+            repulsors=self.repulsors,
+            repulsor_wt=self.repulsor_wt,
+            repulsor_radius=self.repulsor_radius,
+        )
         return self._safe_reward(reward)
 
     def _is_adjacent_to_structure(self, x, y, z):
@@ -299,9 +382,9 @@ class VoxelEnv(Env):
         ]
         for dx, dy, dz in neighbor_offsets:
             nx, ny, nz = x + dx, y + dy, z + dz
-            if (0 <= nx < self.grid_size and
-                0 <= ny < self.grid_size and
-                0 <= nz < self.grid_size):
+            if (0 <= nx < self.gx and
+                0 <= ny < self.gy and
+                0 <= nz < self.gz):
                 if self.grid[nx, ny, nz] == 1:
                     return True
         return False
@@ -317,8 +400,8 @@ class VoxelEnv(Env):
             return False
 
         total_active = int(self.grid.sum())
-        visited = set()
-        q = deque([self.root_voxel])
+        visited: set[tuple[int, int, int]] = set()
+        q: Deque[tuple[int, int, int]] = deque([cast(tuple[int, int, int], self.root_voxel)])
         visited.add(self.root_voxel)
 
         neighbor_offsets = [
@@ -331,9 +414,9 @@ class VoxelEnv(Env):
             x, y, z = q.popleft()
             for dx, dy, dz in neighbor_offsets:
                 nx, ny, nz = x + dx, y + dy, z + dz
-                if (0 <= nx < self.grid_size and
-                    0 <= ny < self.grid_size and
-                    0 <= nz < self.grid_size):
+                if (0 <= nx < self.gx and
+                    0 <= ny < self.gy and
+                    0 <= nz < self.gz):
                     if self.grid[nx, ny, nz] == 1 and (nx, ny, nz) not in visited:
                         visited.add((nx, ny, nz))
                         q.append((nx, ny, nz))
