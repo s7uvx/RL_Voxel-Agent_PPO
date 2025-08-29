@@ -10,7 +10,7 @@ def weird_str_to_float(input_string: str) -> float:
     except ValueError:
         return -0.2  # fallback in case of error
 
-def get_reward_gh(grid, merged_gh_file, epw_file, sun_wt, str_wt) -> float:
+def get_reward_gh(grid, merged_gh_file, epw_file, sun_wt=0.3, str_wt=0.5, cst_wt=0.1, wst_wt=0.1) -> float:
     if grid is None:
         return -0.2
 
@@ -26,27 +26,33 @@ def get_reward_gh(grid, merged_gh_file, epw_file, sun_wt, str_wt) -> float:
     epw_path = gh.DataTree("epw_path")
     epw_path.Append([0], [epw_file])
 
-    try:
-        # Evaluate Grasshopper definition
-        output = gh.EvaluateDefinition(merged_gh_file, [epw_path, voxel_in])
+    # try:
+    # Evaluate Grasshopper definition
+    output = gh.EvaluateDefinition(merged_gh_file, [epw_path, voxel_in])
 
-        # Extract reward values
-        cyclops_reward_str = output['values'][0]['InnerTree']['{0;0}'][0]['data']
-        karamba_reward_str = output['values'][1]['InnerTree']['{0}'][0]['data']
+    # Extract reward values
+    cyclops_reward_str = output['values'][0]['InnerTree']['{0;0}'][0]['data']
+    karamba_reward_str = output['values'][1]['InnerTree']['{0}'][0]['data']
+    panel_cost_reward_str = output['values'][2]['InnerTree']['{0}'][0]['data']
+    panel_waste_reward_str = output['values'][3]['InnerTree']['{0;0}'][0]['data']
+    # Parse to float
+    cyclops_reward = weird_str_to_float(cyclops_reward_str)
+    karamba_reward = weird_str_to_float(karamba_reward_str)
+    panel_cost_reward = weird_str_to_float(panel_cost_reward_str)
+    panel_waste_reward = weird_str_to_float(panel_waste_reward_str)
 
-        # Parse to float
-        cyclops_reward = weird_str_to_float(cyclops_reward_str)
-        karamba_reward = weird_str_to_float(karamba_reward_str)
+    # Weighted reward
+    reward = sun_wt * cyclops_reward + \
+        str_wt * karamba_reward + \
+        cst_wt * panel_cost_reward + \
+        wst_wt * panel_waste_reward
 
-        # Weighted reward
-        reward = sun_wt * cyclops_reward + str_wt * karamba_reward
+    # ✅ Log reward summary only
+    print(f"[REWARD] Cyclops: {sun_wt * cyclops_reward:.2f}, Karamba: {str_wt * karamba_reward:.2f}, Cost: {cst_wt * panel_cost_reward:.2f}, Waste: {wst_wt * panel_waste_reward:.2f} - Total: {reward:.2f}")
 
-        # ✅ Log reward summary only
-        print(f"[REWARD] Cyclops: {sun_wt * cyclops_reward:.2f}, Karamba: {str_wt * karamba_reward:.2f}, Total: {reward:.2f}")
-
-    except Exception as e:
-        print(f"[ERROR] Failed to evaluate GH definition: {e}")
-        reward = -0.2
+    # except Exception as e:
+    #     print(f"[ERROR] Failed to evaluate GH definition: {e}")
+    #     reward = -0.2
 
     gc.collect()
     return reward
