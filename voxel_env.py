@@ -14,12 +14,19 @@ from gh_file_runner import get_reward_gh
 
 class VoxelEnv(Env):
     """
-    Voxel placement environment with action masking and a safety NO-OP action.
+    Voxel placement environment with action masking, safety NO-OP action, and facade options.
 
     Actions:
         0 .. (N-1):           ADD voxel at linearized location
         N .. (2N-1):          DELETE voxel at linearized location
         2N (NOOP_IDX):        NO-OP (always legal, small penalty)
+        
+        Facade actions (4 directions × 4 parameters × 7 values each):
+        (2N+1) .. (2N+112):   Facade parameter adjustments
+        - Actions 2N+1 to 2N+28:   min_cols for [east, north, west, south] (7 values each)
+        - Actions 2N+29 to 2N+56:  max_cols for [east, north, west, south] (7 values each)
+        - Actions 2N+57 to 2N+84:  min_rows for [east, north, west, south] (7 values each)
+        - Actions 2N+85 to 2N+112: max_rows for [east, north, west, south] (7 values each)
 
     Where N = gx * gy * gz (grid_size if int, or product of a 3D tuple)
     """
@@ -51,11 +58,24 @@ class VoxelEnv(Env):
         self.root_voxel = (rx, ry, 0)
         self.grid[rx, ry, 0] = 1
 
-        # Action space with NO-OP
+        # Action space with NO-OP and facade actions
         total_locations = int(self.gx * self.gy * self.gz)
         self.total_locations = total_locations
         self.NOOP_IDX = 2 * total_locations
-        self.action_space = spaces.Discrete(self.NOOP_IDX + 1)
+        
+        # Facade parameters: 4 directions × 4 parameters × 7 values = 112 actions
+        self.FACADE_ACTIONS = 4 * 4 * 7  # 112 facade actions
+        self.action_space = spaces.Discrete(self.NOOP_IDX + 1 + self.FACADE_ACTIONS)
+        
+        # Facade parameter ranges and current values
+        self.facade_min_val = 1
+        self.facade_max_val = 7
+        self.current_facade_params = {
+            'min_cols': np.array([1, 1, 1, 1], dtype=np.int32),  # [east, north, west, south]
+            'max_cols': np.array([7, 7, 7, 7], dtype=np.int32),
+            'min_rows': np.array([1, 1, 1, 1], dtype=np.int32),
+            'max_rows': np.array([7, 7, 7, 7], dtype=np.int32)
+        }
 
         self.observation_space = spaces.Box(
             low=0, high=1,
@@ -73,10 +93,12 @@ class VoxelEnv(Env):
 
         self.timeouts = 0
         self.port = port
-        self.merged_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V5_hops.ghx')
+        self.merged_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V6_hops.ghx')
         compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
         self.sun_wt = 0.3
         self.str_wt = 0.7
+        self.cst_wt = 0.1
+        self.wst_wt = 0.1
         # Repulsor config
         self.num_repulsors = num_repulsors
         self.repulsor_wt = repulsor_wt
@@ -109,20 +131,63 @@ class VoxelEnv(Env):
     def _coords_to_idx(self, x, y, z):
         return int(x + y * self.gx + z * (self.gx * self.gy))
 
+    def _decode_facade_action(self, action_idx):
+        """
+        Decode facade action index to parameter type, direction, and value.
+        
+        Facade actions start at NOOP_IDX + 1
+        Layout: 4 parameters × 4 directions × 7 values
+        """
+        facade_offset = action_idx - (self.NOOP_IDX + 1)
+        
+        # Which parameter (0=min_cols, 1=max_cols, 2=min_rows, 3=max_rows)
+        param_idx = facade_offset // (4 * 7)
+        remainder = facade_offset % (4 * 7)
+        
+        # Which direction (0=east, 1=north, 2=west, 3=south)
+        direction_idx = remainder // 7
+        
+        # Which value (0-6 maps to values 1-7)
+        value_idx = remainder % 7
+        value = value_idx + 1  # Convert 0-6 to 1-7
+        
+        param_names = ['min_cols', 'max_cols', 'min_rows', 'max_rows']
+        direction_names = ['east', 'north', 'west', 'south']
+        
+        return param_names[param_idx], direction_idx, value, direction_names[direction_idx]
+
+    def _apply_facade_action(self, param_name, direction_idx, value):
+        """Apply facade parameter change and return reward"""
+        old_value = self.current_facade_params[param_name][direction_idx]
+        self.current_facade_params[param_name][direction_idx] = value
+        
+        reward = get_reward_gh(
+            self.grid, 
+            self.merged_gh_file, 
+            self.current_epw, 
+            self.sun_wt, 
+            self.str_wt, 
+            self.cst_wt, 
+            self.wst_wt, 
+            repulsors=self.repulsors,
+            facade_params=self.current_facade_params)
+        
+        return reward
+
     # ---------------------------
     # Action masking support
     # ---------------------------
     def action_masks(self) -> np.ndarray:
         """
-        Boolean mask of shape (2 * total_locations + 1,)
+        Boolean mask of shape (2 * total_locations + 1 + facade_actions,)
         True = allowed, False = masked (invalid).
-        Last index (NOOP_IDX) is always True.
+        NOOP and all facade actions are always allowed.
         """
-        total_locations = self.total_locations
-        mask = np.zeros(self.NOOP_IDX + 1, dtype=bool)
+        total_actions = self.NOOP_IDX + 1 + self.FACADE_ACTIONS
+        mask = np.zeros(total_actions, dtype=bool)
 
         # ADD actions in [0, total_locations)
-        for loc in range(total_locations):
+        for loc in range(self.total_locations):
             x, y, z = self._idx_to_coords(loc)
             valid_add = (
                 self.grid[x, y, z] == 0
@@ -132,7 +197,7 @@ class VoxelEnv(Env):
             mask[loc] = valid_add
 
         # DELETE actions in [total_locations, 2*total_locations)
-        for loc in range(total_locations):
+        for loc in range(self.total_locations):
             x, y, z = self._idx_to_coords(loc)
             valid_del = (
                 self.grid[x, y, z] == 1
@@ -146,16 +211,25 @@ class VoxelEnv(Env):
                 self.grid[x, y, z] = 1
                 valid_del = still_connected
 
-            mask[total_locations + loc] = valid_del
+            mask[self.total_locations + loc] = valid_del
 
         # Always allow NO-OP
         mask[self.NOOP_IDX] = True
+        
+        # Always allow all facade actions
+        mask[self.NOOP_IDX + 1:] = True
+
         return mask
 
     def _action_to_coords(self, action_idx):
-        """Convert action index to action type and 3D coordinates"""
+        """Convert action index to action type and coordinates/parameters"""
         if action_idx == self.NOOP_IDX:
             return "noop", (None, None, None)
+        
+        if action_idx > self.NOOP_IDX:
+            # Facade action
+            param_name, direction_idx, value, direction_name = self._decode_facade_action(action_idx)
+            return "facade", (param_name, direction_idx, value, direction_name)
 
         total_locations = self.total_locations
         if action_idx < total_locations:
@@ -177,6 +251,14 @@ class VoxelEnv(Env):
         self.step_count = 0
         self._added_cooldown.clear()
         self._deleted_cooldown.clear()
+
+        # Reset facade parameters to defaults
+        self.current_facade_params = {
+            'min_cols': np.array([1, 1, 1, 1], dtype=np.int32),
+            'max_cols': np.array([7, 7, 7, 7], dtype=np.int32),
+            'min_rows': np.array([1, 1, 1, 1], dtype=np.int32),
+            'max_rows': np.array([7, 7, 7, 7], dtype=np.int32)
+        }
 
         # New root voxel each episode (cannot delete)
         rx = rng.integers(0, self.gx)
@@ -224,6 +306,7 @@ class VoxelEnv(Env):
             "epw_file": os.path.basename(self.current_epw or ""),
             "action_masks": self.action_masks(),
             "repulsors": np.array(self.repulsors, dtype=np.int32) if self.repulsors else np.empty((0,3), dtype=np.int32),
+            "facade_params": self.current_facade_params.copy()
         }
         return observation, info
 
@@ -248,18 +331,26 @@ class VoxelEnv(Env):
         self.step_count += 1
         self._tick_cooldowns()  # age cooldowns at each step
 
-        action_type, (x, y, z) = self._action_to_coords(action_idx)
+        action_type, coords_or_params = self._action_to_coords(action_idx)
         base_reward = 0.0
 
         if action_type == "noop":
             base_reward = -0.01  # small penalty so it's used only when truly blocked
             msg = "NOOP"
 
+        elif action_type == "facade":
+            param_name, direction_idx, value, direction_name = coords_or_params
+            base_reward = self._apply_facade_action(param_name, direction_idx, value)
+            msg = f"FACADE {param_name}[{direction_name}] = {value}"
+            print(f"[STEP] 🏢 {msg}")
+
         elif action_type == "add":
+            x, y, z = coords_or_params
             base_reward = self._add_voxel(x, y, z)
             msg = "ADD"
 
         elif action_type == "delete":
+            x, y, z = coords_or_params
             base_reward = self._delete_voxel(x, y, z)
             msg = "DELETE"
 
@@ -270,22 +361,24 @@ class VoxelEnv(Env):
         # Optional per-step penalty to discourage churn
         reward = float(base_reward) - float(self.step_penalty)
 
-        if reward > -0.1 and msg in ("ADD"):
-            print(f"[STEP] ➕ {msg} at ({x},{y},{z}) - SUCCESS")
-        elif reward > -0.1 and msg in ("DELETE"):
-            print(f"[STEP] ➖ {msg} at ({x},{y},{z}) - SUCCESS")
-        else:
-            print(f"[STEP] ❌ {msg} at ({x},{y},{z}) - RESULT (reward: {reward})")
+        if action_type in ["add", "delete"]:
+            x, y, z = coords_or_params
+            if reward > -0.1 and msg == "ADD":
+                print(f"[STEP] ➕ {msg} at ({x},{y},{z}) - SUCCESS")
+            elif reward > -0.1 and msg == "DELETE":
+                print(f"[STEP] ➖ {msg} at ({x},{y},{z}) - SUCCESS")
+            else:
+                print(f"[STEP] ❌ {msg} at ({x},{y},{z}) - RESULT (reward: {reward})")
 
         # Episode termination logic
         total_voxels = self.total_locations
         active_voxels = int(np.sum(self.grid))
         terminated = bool(active_voxels >= 0.6 * total_voxels or active_voxels <= 1)
 
-        # Terminate if only NO-OP remains (no adds/deletes possible)
+        # Terminate if only NO-OP and facade actions remain (no adds/deletes possible)
         mask_now = self.action_masks()
-        no_real_actions = not np.any(mask_now[:self.NOOP_IDX])
-        terminated = bool(terminated or no_real_actions)
+        no_voxel_actions = not np.any(mask_now[:self.NOOP_IDX])
+        terminated = bool(terminated or no_voxel_actions)
 
         # Time-limit truncation
         truncated = self.step_count >= self.max_steps
@@ -293,7 +386,8 @@ class VoxelEnv(Env):
         observation = self.grid.flatten().astype(np.float32)
         info = {
             "epw_file": os.path.basename(self.current_epw or ""),
-            "action_masks": self.action_masks()  # keep mask up to date every step
+            "action_masks": self.action_masks(),
+            "facade_params": self.current_facade_params.copy()
         }
         return observation, reward, terminated, truncated, info
 
@@ -324,7 +418,7 @@ class VoxelEnv(Env):
             self._added_cooldown[(x, y, z)] = self.cooldown_steps
             self._deleted_cooldown.pop((x, y, z), None)
 
-        # Get reward from Grasshopper
+        # Get reward from Grasshopper (now includes facade parameters)
         reward = get_reward_gh(
             self.grid,
             self.merged_gh_file,
@@ -334,6 +428,7 @@ class VoxelEnv(Env):
             repulsors=self.repulsors,
             repulsor_wt=self.repulsor_wt,
             repulsor_radius=self.repulsor_radius,
+            facade_params=self.current_facade_params,
         )
         return self._safe_reward(reward)
 
@@ -360,7 +455,7 @@ class VoxelEnv(Env):
             self._deleted_cooldown[(x, y, z)] = self.cooldown_steps
             self._added_cooldown.pop((x, y, z), None)
 
-        # Get reward from Grasshopper
+        # Get reward from Grasshopper (now includes facade parameters)
         reward = get_reward_gh(
             self.grid,
             self.merged_gh_file,
@@ -370,6 +465,7 @@ class VoxelEnv(Env):
             repulsors=self.repulsors,
             repulsor_wt=self.repulsor_wt,
             repulsor_radius=self.repulsor_radius,
+            facade_params=self.current_facade_params,
         )
         return self._safe_reward(reward)
 

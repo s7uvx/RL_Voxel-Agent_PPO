@@ -23,6 +23,7 @@ def get_reward_gh(
     repulsors: list | None = None,
     repulsor_wt: float = 0.0,
     repulsor_radius: float = 2.0,
+    facade_params: dict | None = None,
 ) -> float:
     if grid is None:
         return -0.2
@@ -38,10 +39,51 @@ def get_reward_gh(
     # Send EPW path to Hops
     epw_path = gh.DataTree("epw_path")
     epw_path.Append([0], [epw_file])
+    
+    # Prepare facade parameters
+    if facade_params is None:
+        # Default facade parameters if none provided
+        facade_params = {
+            'min_cols': np.array([1, 1, 1, 1], dtype=np.int32),
+            'max_cols': np.array([7, 7, 7, 7], dtype=np.int32),
+            'min_rows': np.array([1, 1, 1, 1], dtype=np.int32),
+            'max_rows': np.array([7, 7, 7, 7], dtype=np.int32)
+        }
 
-    # try:
-    # Evaluate Grasshopper definition
-    output = gh.EvaluateDefinition(merged_gh_file, [epw_path, voxel_in])
+    # Ensure min <= max constraints
+    min_cols = np.array(facade_params['min_cols'], dtype=int)
+    max_cols = np.array(facade_params['max_cols'], dtype=int)
+    min_rows = np.array(facade_params['min_rows'], dtype=int)
+    max_rows = np.array(facade_params['max_rows'], dtype=int)
+    
+    # Enforce constraints
+    max_cols = np.maximum(max_cols, min_cols)
+    max_rows = np.maximum(max_rows, min_rows)
+    
+
+    # Convert to JSON lists and create DataTrees for Grasshopper
+    # cols_min_json = json.dumps(min_cols.tolist())
+    cols_min_tree = gh.DataTree("cols_min")
+    cols_min_tree.Append([0], min_cols.tolist())
+
+    cols_max_tree = gh.DataTree("cols_max")
+    cols_max_tree.Append([0], max_cols.tolist())
+
+    rows_min_tree = gh.DataTree("rows_min")
+    rows_min_tree.Append([0], min_rows.tolist())
+
+    rows_max_tree = gh.DataTree("rows_max")
+    rows_max_tree.Append([0], max_rows.tolist())
+
+    # print(cols_min_json, cols_max_json, rows_min_json, rows_max_json)
+
+    trees = [epw_path, voxel_in, cols_min_tree, cols_max_tree, rows_min_tree, rows_max_tree]
+
+    # Evaluate Grasshopper definition with all input trees
+    output = gh.EvaluateDefinition(
+        merged_gh_file, 
+        trees
+    )
 
     # Extract reward values
     cyclops_reward_str = output['values'][0]['InnerTree']['{0;0}'][0]['data']
@@ -85,13 +127,14 @@ def get_reward_gh(
         # Be robust: never break training due to repulsor math
         repulsor_penalty = 0.0
 
-    # ✅ Log reward summary only
+    # ✅ Log reward summary with facade info
     print(
         f"[REWARD] Cyclops: {sun_wt * cyclops_reward:.2f}, "
         f"Karamba: {str_wt * karamba_reward:.2f}, "
         f"Cost: {cst_wt * panel_cost_reward:.2f}, "
         f"Waste: {wst_wt * panel_waste_reward:.2f}, "
-        f"Repulsor: -{repulsor_penalty:.2f} - Total: {reward:.2f}"
+        f"Repulsor: -{repulsor_penalty:.2f} - Total: {reward:.2f} | "
+        f"Facade: cols[{min_cols.tolist()}-{max_cols.tolist()}], rows[{min_rows.tolist()}-{max_rows.tolist()}]"
     )
 
     # except Exception as e:

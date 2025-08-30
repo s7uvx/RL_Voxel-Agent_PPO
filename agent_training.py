@@ -32,6 +32,32 @@ def parse_grid(grid_str: str):
         return tuple(map(int, parts))
     raise ValueError(f"Invalid --grid value: {grid_str}. Use 5 or 5,5,10 or (5,5,10)")
 
+# Enhanced export function with EPW and facade parameters
+def export_voxel_grid_enhanced(grid, filename, epw_file=None, facade_params=None, action_info=None):
+    """Export voxel grid with additional metadata"""
+    data = {
+        "voxels": grid.tolist(),
+        "epw_file": os.path.basename(epw_file) if epw_file else None,
+        "facade_params": {}
+    }
+    
+    # Add facade parameters if available
+    if facade_params:
+        # Convert numpy arrays to lists for JSON serialization
+        for key, value in facade_params.items():
+            if hasattr(value, 'tolist'):
+                data["facade_params"][key] = value.tolist()
+            else:
+                data["facade_params"][key] = value
+    
+    # Add action information if available
+    if action_info:
+        data["action_info"] = action_info
+    
+    with open(filename, 'w') as f:
+        import json
+        json.dump(data, f, indent=2)
+
 # ---------------------------
 # CLI args
 # ---------------------------
@@ -39,11 +65,9 @@ parser = argparse.ArgumentParser(description='Train MaskablePPO agent for voxel 
 parser.add_argument('--port', type=int, default=81, help='Base port number for VoxelEnv (default: 81)')
 parser.add_argument('--new', action='store_true', default=False, help='Start a new model instead of loading an existing one')
 parser.add_argument('--n_envs', type=int, default=1, help='Number of parallel environments (default: 1)')
-parser.add_argument('--grid', type=parse_grid, default='5', help='Grid: int like 5 or tuple like 5,5,10 or (5,5,10)')
+parser.add_argument('--grid', type=parse_grid, default='(5,5,5)', help='Grid: int like 5 or tuple like 5,5,10 or (5,5,10)')
 parser.add_argument('--chk_freq', type=int, default=500, help='Frequency of saving checkpoints (default: 100)')
 args = parser.parse_args()
-
-
 
 GRID_PARAM = parse_grid(args.grid)
 
@@ -79,7 +103,7 @@ env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
 # PPO hyperparams (stable defaults)
 # ---------------------------
 num_steps = 256          # rollout length per env 
-num_epochs = 2          # PPO epochs per update
+num_epochs = 1          # PPO epochs per update
 batch_size = 64          # must divide (num_steps * num_envs); 1024*k is always divisible by 256
 
 starting_step = 0
@@ -169,17 +193,51 @@ for step in range(max_eval_steps):
     obs, reward, terminated, truncated, info = raw_eval_env.step(action_idx)
     done = bool(terminated or truncated)
 
-    # decode action for logging clarity (handles NO-OP)
-    action_type, (x, y, z) = raw_eval_env.unwrapped._action_to_coords(int(action_idx))  # type: ignore[attr-defined]
+    # decode action for logging clarity (handles NO-OP and facade actions)
+    action_type, coords_or_params = raw_eval_env.unwrapped._action_to_coords(int(action_idx))  # type: ignore[attr-defined]
     total_actions = raw_eval_env.action_space.n  # type: ignore[attr-defined]
-    print(f"Step {step}: Action Index: {action_idx} | Action: {action_type.upper()} "
-          f"at ({x},{y},{z}) | Total Actions: {total_actions} | Reward: {reward}")
+    
+    # Create action info for export
+    action_info = {
+        "step": step,
+        "action_idx": int(action_idx),
+        "action_type": action_type,
+        "reward": float(reward),
+        "terminated": bool(terminated),
+        "truncated": bool(truncated)
+    }
+    
+    if action_type in ["add", "delete"]:
+        x, y, z = coords_or_params
+        action_info["coordinates"] = [int(x), int(y), int(z)]
+        print(f"Step {step}: Action Index: {action_idx} | Action: {action_type.upper()} "
+              f"at ({x},{y},{z}) | Total Actions: {total_actions} | Reward: {reward}")
+    elif action_type == "facade":
+        param_name, direction_idx, value, direction_name = coords_or_params
+        action_info["facade_change"] = {
+            "parameter": param_name,
+            "direction": direction_name,
+            "direction_idx": int(direction_idx),
+            "value": int(value)
+        }
+        print(f"Step {step}: Action Index: {action_idx} | Action: FACADE {param_name}[{direction_name}] = {value} "
+              f"| Total Actions: {total_actions} | Reward: {reward}")
+    else:
+        print(f"Step {step}: Action Index: {action_idx} | Action: {action_type.upper()} "
+              f"| Total Actions: {total_actions} | Reward: {reward}")
 
     if step % 10 == 0:
         raw_eval_env.unwrapped.render()
 
+    # Export enhanced voxel grid with EPW and facade parameters
     filename = os.path.join(output_folder, f"step_{step:03}.json")
-    export_voxel_grid(raw_eval_env.unwrapped.grid, filename)  # type: ignore[attr-defined]
+    export_voxel_grid_enhanced(
+        raw_eval_env.unwrapped.grid,  # type: ignore[attr-defined]
+        filename,
+        epw_file=raw_eval_env.unwrapped.current_epw,  # type: ignore[attr-defined]
+        facade_params=raw_eval_env.unwrapped.current_facade_params,  # type: ignore[attr-defined]
+        action_info=action_info
+    )
 
     if done:
         obs, info = raw_eval_env.reset()
