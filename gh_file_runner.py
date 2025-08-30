@@ -39,7 +39,7 @@ def get_reward_gh(
     # Send EPW path to Hops
     epw_path = gh.DataTree("epw_path")
     epw_path.Append([0], [epw_file])
-    
+
     # Prepare facade parameters
     if facade_params is None:
         # Default facade parameters if none provided
@@ -84,6 +84,7 @@ def get_reward_gh(
         merged_gh_file, 
         trees
     )
+    # print(output)
 
     # Extract reward values
     cyclops_reward_str = output['values'][0]['InnerTree']['{0;0}'][0]['data']
