@@ -194,7 +194,8 @@ for step in range(max_eval_steps):
     done = bool(terminated or truncated)
 
     # decode action for logging clarity (handles NO-OP and facade actions)
-    action_type, coords_or_params = raw_eval_env.unwrapped._action_to_coords(int(action_idx))  # type: ignore[attr-defined]
+    voxel_part, facade_part = raw_eval_env.unwrapped._decode_combined_action(int(action_idx))  # <-- patched
+    action_type, coords_or_params = voxel_part  # matches old unpacking API
     total_actions = raw_eval_env.action_space.n  # type: ignore[attr-defined]
     
     # Create action info for export
@@ -212,8 +213,12 @@ for step in range(max_eval_steps):
         action_info["coordinates"] = [int(x), int(y), int(z)]
         print(f"Step {step}: Action Index: {action_idx} | Action: {action_type.upper()} "
               f"at ({x},{y},{z}) | Total Actions: {total_actions} | Reward: {reward}")
-    elif action_type == "facade":
-        param_name, direction_idx, value, direction_name = coords_or_params
+    elif action_type == "noop":
+        print(f"Step {step}: Action Index: {action_idx} | Action: NOOP "
+              f"| Total Actions: {total_actions} | Reward: {reward}")
+    # facade actions are separate, decode from facade_part
+    elif facade_part is not None:
+        _, (param_name, direction_idx, value, direction_name) = facade_part
         action_info["facade_change"] = {
             "parameter": param_name,
             "direction": direction_name,
@@ -223,8 +228,9 @@ for step in range(max_eval_steps):
         print(f"Step {step}: Action Index: {action_idx} | Action: FACADE {param_name}[{direction_name}] = {value} "
               f"| Total Actions: {total_actions} | Reward: {reward}")
     else:
-        print(f"Step {step}: Action Index: {action_idx} | Action: {action_type.upper()} "
+        print(f"Step {step}: Action Index: {action_idx} | Action: INVALID "
               f"| Total Actions: {total_actions} | Reward: {reward}")
+
 
     if step % 10 == 0:
         raw_eval_env.unwrapped.render()
