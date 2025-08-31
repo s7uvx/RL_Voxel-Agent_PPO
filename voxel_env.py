@@ -8,6 +8,7 @@ import compute_rhino3d.Util
 import compute_rhino3d.Grasshopper as gh
 import gc
 from typing import Deque, Tuple, cast, Callable, Iterable, Sequence, Optional
+from collections import defaultdict  # added
 
 from gh_file_runner import get_reward_gh
 
@@ -28,8 +29,8 @@ class VoxelEnv(Env):
       voxel_idx in [0 .. 2N]   (2N is NO-OP)
       facade_idx in [0 .. 56] (56 is NO-FACADE)
     """
-    def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=3, step_penalty=0.0,
-                 num_repulsors: int = 3, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
+    def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=7, step_penalty=0.0,
+                 num_repulsors: int = 2, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
                  repulsor_provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]] = None):
         super(VoxelEnv, self).__init__()
         # Normalize grid_size to 3D dims (gx, gy, gz)
@@ -92,12 +93,18 @@ class VoxelEnv(Env):
         self._deleted_cooldown = {}  # forbid ADD here for N steps
         self.step_penalty = step_penalty  # tiny cost per step (optional)
 
+        # Loop-churn penalty settings
+        self.loop_penalty_scale = 0.05      # strength of penalty per toggle (tune)
+        self.loop_penalty_power = 1.0       # growth curve; >1 amplifies repeated flips
+        self.loop_decay = 0.98              # per-step decay of toggle memory
+        self._toggle_counts: dict[tuple[int, int, int], float] = {}  # voxel -> decaying toggle count
+
         self.timeouts = 0
         self.port = port
         self.merged_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V6_hops.ghx')
         compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
         self.sun_wt = 0.5
-        self.str_wt = 0.2
+        self.str_wt = 0.3
         self.cst_wt = 0.1
         self.wst_wt = 0.1
         # Repulsor config
@@ -342,6 +349,20 @@ class VoxelEnv(Env):
                 d[k] -= 1
                 if d[k] <= 0:
                     del d[k]
+        # Decay loop-churn memory
+        if self._toggle_counts:
+            for k in list(self._toggle_counts.keys()):
+                self._toggle_counts[k] *= self.loop_decay
+                if self._toggle_counts[k] < 0.05:
+                    del self._toggle_counts[k]
+
+    def _toggle_penalty(self, x: int, y: int, z: int) -> float:
+        """Increase per-voxel toggle counter and return penalty."""
+        key = (int(x), int(y), int(z))
+        c = float(self._toggle_counts.get(key, 0.0))
+        c = c * self.loop_decay + 1.0  # decayed memory + this flip
+        self._toggle_counts[key] = c
+        return float(self.loop_penalty_scale * (c ** self.loop_penalty_power))
 
     def step(self, action_idx):
         # Time/bookkeeping
@@ -449,6 +470,8 @@ class VoxelEnv(Env):
             repulsor_radius=self.repulsor_radius,
             facade_params=self.current_facade_params,
         )
+        # Apply loop-churn penalty for flipping this voxel
+        reward -= self._toggle_penalty(x, y, z)
         return self._safe_reward(reward)
 
     def _delete_voxel(self, x, y, z):
@@ -463,7 +486,6 @@ class VoxelEnv(Env):
         # Tentative delete with connectivity check
         self.grid[x, y, z] = 0
         if not self._is_structure_connected():
-            # revert if it disconnects the structure
             self.grid[x, y, z] = 1
             return -0.4
 
@@ -488,6 +510,8 @@ class VoxelEnv(Env):
             repulsor_radius=self.repulsor_radius,
             facade_params=self.current_facade_params,
         )
+        # Apply loop-churn penalty for flipping this voxel
+        reward -= self._toggle_penalty(x, y, z)
         return self._safe_reward(reward)
 
     def _is_adjacent_to_structure(self, x, y, z):
