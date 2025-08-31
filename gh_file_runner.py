@@ -19,7 +19,6 @@ def get_reward_gh(
     str_wt: float = 0.5,
     cst_wt: float = 0.1,
     wst_wt: float = 0.1,
-    *,
     repulsors: list | None = None,
     repulsor_wt: float = 0.0,
     repulsor_radius: float = 2.0,
@@ -44,40 +43,25 @@ def get_reward_gh(
     if facade_params is None:
         # Default facade parameters if none provided
         facade_params = {
-            'min_cols': np.array([1, 1, 1, 1], dtype=np.int32),
-            'max_cols': np.array([7, 7, 7, 7], dtype=np.int32),
-            'min_rows': np.array([1, 1, 1, 1], dtype=np.int32),
-            'max_rows': np.array([7, 7, 7, 7], dtype=np.int32)
+            'cols': np.array([3,3,3,3], dtype=np.int32),
+            'rows': np.array([4,4,4,4], dtype=np.int32)
         }
 
     # Ensure min <= max constraints
-    min_cols = np.array(facade_params['min_cols'], dtype=int)
-    max_cols = np.array(facade_params['max_cols'], dtype=int)
-    min_rows = np.array(facade_params['min_rows'], dtype=int)
-    max_rows = np.array(facade_params['max_rows'], dtype=int)
-    
-    # Enforce constraints
-    max_cols = np.maximum(max_cols, min_cols)
-    max_rows = np.maximum(max_rows, min_rows)
-    
+    cols = np.array(facade_params['cols'], dtype=int)
+    rows = np.array(facade_params['rows'], dtype=int)
+     
 
     # Convert to JSON lists and create DataTrees for Grasshopper
     # cols_min_json = json.dumps(min_cols.tolist())
-    cols_min_tree = gh.DataTree("cols_min")
-    cols_min_tree.Append([0], min_cols.tolist())
+    cols_tree = gh.DataTree("cols")
+    cols_tree.Append([0], cols.tolist())
 
-    cols_max_tree = gh.DataTree("cols_max")
-    cols_max_tree.Append([0], max_cols.tolist())
+    rows_tree = gh.DataTree("rows")
+    rows_tree.Append([0], rows.tolist())
 
-    rows_min_tree = gh.DataTree("rows_min")
-    rows_min_tree.Append([0], min_rows.tolist())
 
-    rows_max_tree = gh.DataTree("rows_max")
-    rows_max_tree.Append([0], max_rows.tolist())
-
-    # print(cols_min_json, cols_max_json, rows_min_json, rows_max_json)
-
-    trees = [epw_path, voxel_in, cols_min_tree, cols_max_tree, rows_min_tree, rows_max_tree]
+    trees = [epw_path, voxel_in, cols_tree, rows_tree]
 
     # Evaluate Grasshopper definition with all input trees
     output = gh.EvaluateDefinition(
@@ -91,11 +75,13 @@ def get_reward_gh(
     karamba_reward_str = output['values'][1]['InnerTree']['{0}'][0]['data']
     panel_cost_reward_str = output['values'][2]['InnerTree']['{0}'][0]['data']
     panel_waste_reward_str = output['values'][3]['InnerTree']['{0;0}'][0]['data']
+    daylight_autonomty_reward_str = output['values'][4]['InnerTree']['{0;0;0}'][0]['data']
     # Parse to float
     cyclops_reward = weird_str_to_float(cyclops_reward_str)
     karamba_reward = weird_str_to_float(karamba_reward_str)
     panel_cost_reward = weird_str_to_float(panel_cost_reward_str)
     panel_waste_reward = weird_str_to_float(panel_waste_reward_str)
+    daylight_autonomty_reward = weird_str_to_float(daylight_autonomty_reward_str)
 
     # Weighted reward from Grasshopper
     reward = (
@@ -103,6 +89,7 @@ def get_reward_gh(
         + str_wt * karamba_reward
         + cst_wt * panel_cost_reward
         + wst_wt * panel_waste_reward
+        + daylight_autonomty_reward
     )
 
     # Optional repulsor proximity penalty (0..repulsor_wt)
@@ -135,7 +122,7 @@ def get_reward_gh(
         f"Cost: {cst_wt * panel_cost_reward:.2f}, "
         f"Waste: {wst_wt * panel_waste_reward:.2f}, "
         f"Repulsor: -{repulsor_penalty:.2f} - Total: {reward:.2f} | "
-        f"Facade: cols[{min_cols.tolist()}-{max_cols.tolist()}], rows[{min_rows.tolist()}-{max_rows.tolist()}]"
+        f"Facade: cols {cols.tolist()}, rows {rows.tolist()}, daylight autonomy {daylight_autonomty_reward:.2f}"
     )
 
     # except Exception as e:

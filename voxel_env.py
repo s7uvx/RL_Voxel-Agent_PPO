@@ -18,15 +18,15 @@ class VoxelEnv(Env):
 
     Actions (combined per step):
       - Voxel action (2N + 1 options): add/delete at each location, plus NO-OP
-      - Facade action (112 + 1 options): facade parameter adjustments, plus NO-FACADE
+      - Facade action (56 + 1 options): facade parameter adjustments, plus NO-FACADE
 
     Combined action space is the cartesian product:
-      action_idx = voxel_idx * (112 + 1) + facade_idx  
+      action_idx = voxel_idx * (56 + 1) + facade_idx  
 
     Where:
       N = gx * gy * gz (grid_size if int, or product of a 3D tuple)
       voxel_idx in [0 .. 2N]   (2N is NO-OP)
-      facade_idx in [0 .. 112] (112 is NO-FACADE)
+      facade_idx in [0 .. 56] (56 is NO-FACADE)
     """
     def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=3, step_penalty=0.0,
                  num_repulsors: int = 3, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
@@ -61,12 +61,12 @@ class VoxelEnv(Env):
         self.total_locations = total_locations
         self.NOOP_IDX = 2 * total_locations
         
-        # Facade parameters: 4 directions × 4 parameters × 7 values = 112 actions
-        self.FACADE_ACTIONS = 4 * 4 * 7  # 112 facade actions
+        # Facade parameters: 2 parameters × 4 directions × 7 values = 56 actions
+        self.FACADE_ACTIONS = 2 * 4 * 7  # 56 facade actions
 
         # Combined action space: (voxel ops) × (facade ops + NO-FACADE)
         self.voxel_actions_count = self.NOOP_IDX + 1  # 2N + 1
-        self.facade_actions_count = self.FACADE_ACTIONS + 1  # 112 + 1 (last is NO-FACADE)
+        self.facade_actions_count = self.FACADE_ACTIONS + 1  # 56 + 1 (last is NO-FACADE)
         self.NO_FACADE_IDX = self.FACADE_ACTIONS  # sentinel index for no facade change
         self.action_space = spaces.Discrete(self.voxel_actions_count * self.facade_actions_count)
         
@@ -74,10 +74,8 @@ class VoxelEnv(Env):
         self.facade_min_val = 1
         self.facade_max_val = 7
         self.current_facade_params = {
-            'min_cols': np.array([1, 1, 1, 1], dtype=np.int32),  # [east, north, west, south]
-            'max_cols': np.array([7, 7, 7, 7], dtype=np.int32),
-            'min_rows': np.array([1, 1, 1, 1], dtype=np.int32),
-            'max_rows': np.array([7, 7, 7, 7], dtype=np.int32)
+            'cols': np.array([3,3,3,3], dtype=np.int32),  # [east, north, west, south]
+            'rows': np.array([4,4,4,4], dtype=np.int32),
         }
 
         self.observation_space = spaces.Box(
@@ -144,7 +142,7 @@ class VoxelEnv(Env):
         direction_idx = remainder // 7
         value_idx = remainder % 7
         value = value_idx + 1
-        param_names = ['min_cols', 'max_cols', 'min_rows', 'max_rows']
+        param_names = ['cols', 'rows']
         direction_names = ['east', 'north', 'west', 'south']
         return param_names[param_idx], direction_idx, value, direction_names[direction_idx]
 
@@ -186,7 +184,7 @@ class VoxelEnv(Env):
 
     def _apply_facade_action(self, param_name, direction_idx, value, compute_reward: bool = True):
         """Apply facade parameter change, optionally compute reward."""
-        old_value = self.current_facade_params[param_name][direction_idx]
+        # old_value = self.current_facade_params[param_name][direction_idx]
         self.current_facade_params[param_name][direction_idx] = value
 
         if not compute_reward:
@@ -275,10 +273,8 @@ class VoxelEnv(Env):
 
         # Reset facade parameters to defaults
         self.current_facade_params = {
-            'min_cols': np.array([1, 1, 1, 1], dtype=np.int32),
-            'max_cols': np.array([7, 7, 7, 7], dtype=np.int32),
-            'min_rows': np.array([1, 1, 1, 1], dtype=np.int32),
-            'max_rows': np.array([7, 7, 7, 7], dtype=np.int32)
+            'cols': np.array([3, 3, 3, 3], dtype=np.int32),
+            'rows': np.array([4, 4, 4, 4], dtype=np.int32)
         }
 
         # New root voxel each episode (cannot delete)
@@ -543,15 +539,6 @@ class VoxelEnv(Env):
                         q.append((nx, ny, nz))
 
         return len(visited) == total_active
-
-    # Deprecated random methods kept for compatibility
-    def _add_random_voxel(self):
-        """DEPRECATED: Use _add_voxel instead"""
-        pass
-
-    def _delete_random_voxel(self):
-        """DEPRECATED: Use _delete_voxel instead"""
-        pass
 
     def render(self):
         print(self.grid)
