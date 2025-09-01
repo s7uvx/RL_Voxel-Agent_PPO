@@ -30,7 +30,7 @@ class VoxelEnv(Env):
       facade_idx in [0 .. 56] (56 is NO-FACADE)
     """
     def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=7, step_penalty=0.0,
-                 num_repulsors: int = 2, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
+                 num_repulsors: int = 2, sun_wt = 0.5, str_wt = 0.3, cst_wt = 0.1, wst_wt = 0.1, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
                  repulsor_provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]] = None):
         super(VoxelEnv, self).__init__()
         # Normalize grid_size to 3D dims (gx, gy, gz)
@@ -103,10 +103,10 @@ class VoxelEnv(Env):
         self.port = port
         self.merged_gh_file = os.path.join(os.getcwd(), 'gh_files', 'RL_Voxel_V6_hops.ghx')
         compute_rhino3d.Util.url = f"http://localhost:{self.port}/"
-        self.sun_wt = 0.5
-        self.str_wt = 0.3
-        self.cst_wt = 0.1
-        self.wst_wt = 0.1
+        self.sun_wt = sun_wt
+        self.str_wt = str_wt
+        self.cst_wt = cst_wt
+        self.wst_wt = wst_wt
         # Repulsor config
         self.num_repulsors = num_repulsors
         self.repulsor_wt = repulsor_wt

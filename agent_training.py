@@ -109,7 +109,7 @@ env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
 # ---------------------------
 num_steps = 256          # rollout length per env 
 num_epochs = 30          # PPO epochs per update
-batch_size = 64          # must divide (num_steps * num_envs); 1024*k is always divisible by 256
+batch_size = 32          # must divide (num_steps * num_envs); 1024*k is always divisible by 256
 
 starting_step = 0
 model_dir = os.path.join(os.getcwd(), 'models', 'PPO')
