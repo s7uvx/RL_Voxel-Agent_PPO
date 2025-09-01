@@ -91,7 +91,7 @@ def mask_fn(env):
 def make_single_env(rank: int = 0):
     def _thunk():
         # give each env a unique port if you scale n_envs
-        e = VoxelEnv(port=args.port + rank, grid_size=GRID_PARAM, device='cpu')  # type: ignore[arg-type]
+        e = VoxelEnv(port=args.port + rank, grid_size=GRID_PARAM, device='cpu', str_wt=0.4, sun_wt=0.4, wst_wt=0.1, cst_wt=0.1)  # type: ignore[arg-type]
         # wrap with the ActionMasker so the policy only samples valid actions
         return ActionMasker(e, mask_fn)
     return _thunk
@@ -103,7 +103,7 @@ env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
 # PPO hyperparams (stable defaults)
 # ---------------------------
 num_steps = 256          # rollout length per env 
-num_epochs = 1          # PPO epochs per update
+num_epochs = 30          # PPO epochs per update
 batch_size = 64          # must divide (num_steps * num_envs); 1024*k is always divisible by 256
 
 starting_step = 0
