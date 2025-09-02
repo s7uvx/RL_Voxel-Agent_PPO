@@ -98,6 +98,9 @@ class VoxelEnv(Env):
         self.loop_penalty_power = 1.0       # growth curve; >1 amplifies repeated flips
         self.loop_decay = 0.98              # per-step decay of toggle memory
         self._toggle_counts: dict[tuple[int, int, int], float] = {}  # voxel -> decaying toggle count
+        # Unstick settings
+        self.unstick_on_exhausted = True
+        self.unstick_penalty = 0.05
 
         self.timeouts = 0
         self.port = port
@@ -213,14 +216,43 @@ class VoxelEnv(Env):
     # ---------------------------
     # Action masking support
     # ---------------------------
+    def facade_action_masks(self) -> np.ndarray:
+        """
+        Boolean mask of length (FACADE_ACTIONS + 1) for facade actions.
+        For now, all are allowed, including NO-FACADE (last index).
+        """
+        mask = np.ones(self.facade_actions_count, dtype=np.bool_)
+        # Ensure NO-FACADE is always allowed
+        mask[self.NO_FACADE_IDX] = True
+        return mask
+
+    def action_masks(self) -> np.ndarray:
+        """
+        Boolean mask for the combined action space (voxel × facade).
+        Allowed iff both sub-actions are allowed. Guarantees at least one action.
+        """
+        vmask = self.voxel_action_masks().astype(np.bool_, copy=False)
+        fmask = self.facade_action_masks().astype(np.bool_, copy=False)
+
+        combined = (vmask[:, None] & fmask[None, :]).reshape(-1).astype(np.bool_, copy=False)
+
+        # Fallback: guarantee at least one valid action (pure NOOP)
+        if not np.any(combined):
+            pure_noop_idx = self.NOOP_IDX * self.facade_actions_count + self.NO_FACADE_IDX
+            combined = np.zeros_like(combined, dtype=np.bool_)
+            combined[pure_noop_idx] = True
+            # Optional debug
+            # print("[MASK] All actions were masked; forcing pure NOOP available.")
+
+        return combined
+
     def voxel_action_masks(self) -> np.ndarray:
         """
         Boolean mask of length (2 * total_locations + 1) for voxel actions only.
         True = allowed, False = masked (invalid).
         NOOP is always allowed.
         """
-        mask = np.zeros(self.voxel_actions_count, dtype=bool)
-
+        mask = np.zeros(self.voxel_actions_count, dtype=np.bool_)
         # ADD actions in [0, total_locations)
         for loc in range(self.total_locations):
             x, y, z = self._idx_to_coords(loc)
@@ -240,6 +272,7 @@ class VoxelEnv(Env):
                 and (x, y, z) not in self._added_cooldown
             )
             if valid_del:
+                # simulate deletion and ensure structure stays connected
                 self.grid[x, y, z] = 0
                 still_connected = self._is_structure_connected()
                 self.grid[x, y, z] = 1
@@ -249,24 +282,6 @@ class VoxelEnv(Env):
         # Always allow NO-OP
         mask[self.NOOP_IDX] = True
         return mask
-
-    def facade_action_masks(self) -> np.ndarray:
-        """
-        Boolean mask of length (FACADE_ACTIONS + 1) for facade actions.
-        For now, all are allowed, including NO-FACADE (last index).
-        """
-        mask = np.ones(self.facade_actions_count, dtype=bool)
-        return mask
-
-    def action_masks(self) -> np.ndarray:
-        """
-        Boolean mask for the combined action space (voxel × facade).
-        Allowed iff both sub-actions are allowed.
-        """
-        vmask = self.voxel_action_masks()
-        fmask = self.facade_action_masks()
-        combined = (vmask[:, None] & fmask[None, :]).reshape(-1)
-        return combined
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -356,6 +371,14 @@ class VoxelEnv(Env):
                 if self._toggle_counts[k] < 0.05:
                     del self._toggle_counts[k]
 
+    def _reset_action_restrictions(self, *, clear_cooldowns: bool = True, clear_toggles: bool = True):
+        """Clear cooldown and/or loop memory to restore valid actions."""
+        if clear_cooldowns:
+            self._added_cooldown.clear()
+            self._deleted_cooldown.clear()
+        if clear_toggles:
+            self._toggle_counts.clear()
+
     def _toggle_penalty(self, x: int, y: int, z: int) -> float:
         """Increase per-voxel toggle counter and return penalty."""
         key = (int(x), int(y), int(z))
@@ -415,10 +438,22 @@ class VoxelEnv(Env):
         active_voxels = int(np.sum(self.grid))
         terminated = bool(active_voxels >= 0.6 * total_voxels)
 
-        # Terminate if no add/delete actions remain (ignoring NOOP)
+        # Terminate or unstick if no add/delete actions remain (ignoring NOOP)
         voxel_mask = self.voxel_action_masks()
         no_voxel_actions = not np.any(voxel_mask[:self.NOOP_IDX])  # excludes NOOP at index NOOP_IDX
-        terminated = bool(terminated or no_voxel_actions)
+
+        unstuck = False
+        if no_voxel_actions and self.unstick_on_exhausted and not terminated:
+            # Try to restore actions: clear cooldowns and loop memory
+            self._reset_action_restrictions(clear_cooldowns=True, clear_toggles=True)
+            voxel_mask2 = self.voxel_action_masks()
+            if np.any(voxel_mask2[:self.NOOP_IDX]):
+                # Recovered actions: apply small penalty, keep episode alive
+                reward -= self.unstick_penalty
+                unstuck = True
+                print("[UNSTICK] Cleared cooldowns/loop memory to restore valid actions.")
+            else:
+                terminated = True  # still no actions possible
 
         # Time-limit truncation
         truncated = self.step_count >= self.max_steps
@@ -427,7 +462,8 @@ class VoxelEnv(Env):
         info = {
             "epw_file": os.path.basename(self.current_epw or ""),
             "action_masks": self.action_masks(),
-            "facade_params": self.current_facade_params.copy()
+            "facade_params": self.current_facade_params.copy(),
+            "unstuck": unstuck
         }
         return observation, reward, terminated, truncated, info
 
@@ -516,6 +552,11 @@ class VoxelEnv(Env):
 
     def _is_adjacent_to_structure(self, x, y, z):
         """Check if position (x,y,z) is adjacent to existing structure"""
+        if not (0 <= x < self.gx and 0 <= y < self.gy and 0 <= z < self.gz):
+            return False
+        if self.grid[x, y, z] == 1:
+            return False
+
         neighbor_offsets = [
             (1, 0, 0), (-1, 0, 0),
             (0, 1, 0), (0, -1, 0),
@@ -523,9 +564,7 @@ class VoxelEnv(Env):
         ]
         for dx, dy, dz in neighbor_offsets:
             nx, ny, nz = x + dx, y + dy, z + dz
-            if (0 <= nx < self.gx and
-                0 <= ny < self.gy and
-                0 <= nz < self.gz):
+            if 0 <= nx < self.gx and 0 <= ny < self.gy and 0 <= nz < self.gz:
                 if self.grid[nx, ny, nz] == 1:
                     return True
         return False
