@@ -30,7 +30,7 @@ class VoxelEnv(Env):
       facade_idx in [0 .. 56] (56 is NO-FACADE)
     """
     def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=7, step_penalty=0.0,
-                 num_repulsors: int = 2, sun_wt = 0.5, str_wt = 0.3, cst_wt = 0.1, wst_wt = 0.1, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
+                 num_repulsors: int = 2, sun_wt = 0.5, str_wt = 0.3, cst_wt = 0.1, wst_wt = 0.1, day_wt = 0.1, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
                  repulsor_provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]] = None):
         super(VoxelEnv, self).__init__()
         # Normalize grid_size to 3D dims (gx, gy, gz)
@@ -110,6 +110,7 @@ class VoxelEnv(Env):
         self.str_wt = str_wt
         self.cst_wt = cst_wt
         self.wst_wt = wst_wt
+        self.day_wt = day_wt
         # Repulsor config
         self.num_repulsors = num_repulsors
         self.repulsor_wt = repulsor_wt
@@ -207,7 +208,8 @@ class VoxelEnv(Env):
             self.sun_wt, 
             self.str_wt, 
             self.cst_wt, 
-            self.wst_wt, 
+            self.wst_wt,
+            self.day_wt, 
             repulsors=self.repulsors,
             facade_params=self.current_facade_params)
         
@@ -499,8 +501,11 @@ class VoxelEnv(Env):
             self.grid,
             self.merged_gh_file,
             self.current_epw,
-            self.sun_wt,
-            self.str_wt,
+            self.sun_wt, 
+            self.str_wt, 
+            self.cst_wt, 
+            self.wst_wt,
+            self.day_wt, 
             repulsors=self.repulsors,
             repulsor_wt=self.repulsor_wt,
             repulsor_radius=self.repulsor_radius,
@@ -541,6 +546,7 @@ class VoxelEnv(Env):
             self.str_wt,
             self.cst_wt,
             self.wst_wt,
+            self.day_wt,
             repulsors=self.repulsors,
             repulsor_wt=self.repulsor_wt,
             repulsor_radius=self.repulsor_radius,

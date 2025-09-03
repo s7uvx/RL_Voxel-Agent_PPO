@@ -5,11 +5,14 @@ import os
 import numpy as np
 
 def weird_str_to_float(input_string: str) -> float:
-    numeric_part = ''.join(char for char in input_string if char.isdigit() or char == '.')
+    s = ''.join(ch for ch in str(input_string) if ch.isdigit() or ch in '.-')
     try:
-        return float(numeric_part)
-    except ValueError:
-        return -0.2  # fallback in case of error
+        v = float(s)
+        if not np.isfinite(v):
+            return 0.0
+        return v
+    except Exception:
+        return 0.0  # neutral fallback
 
 def get_reward_gh(
     grid,
@@ -19,6 +22,7 @@ def get_reward_gh(
     str_wt: float = 0.5,
     cst_wt: float = 0.1,
     wst_wt: float = 0.1,
+    day_wt: float = 0.1,
     repulsors: list | None = None,
     repulsor_wt: float = 0.0,
     repulsor_radius: float = 2.0,
@@ -60,7 +64,6 @@ def get_reward_gh(
     rows_tree = gh.DataTree("rows")
     rows_tree.Append([0], rows.tolist())
 
-
     trees = [epw_path, voxel_in, cols_tree, rows_tree]
 
     # Evaluate Grasshopper definition with all input trees
@@ -71,16 +74,20 @@ def get_reward_gh(
     # print(output)
 
     # Extract reward values
+
     cyclops_reward_str = output['values'][0]['InnerTree']['{0;0}'][0]['data']
-    karamba_reward_str = output['values'][1]['InnerTree']['{0}'][0]['data']
-    panel_cost_reward_str = output['values'][2]['InnerTree']['{0}'][0]['data']
-    panel_waste_reward_str = output['values'][3]['InnerTree']['{0;0}'][0]['data']
-    daylight_autonomty_reward_str = output['values'][4]['InnerTree']['{0;0;0}'][0]['data']
-    # Parse to float
     cyclops_reward = weird_str_to_float(cyclops_reward_str)
+
+    karamba_reward_str = output['values'][1]['InnerTree']['{0}'][0]['data']
     karamba_reward = weird_str_to_float(karamba_reward_str)
+
+    panel_cost_reward_str = output['values'][2]['InnerTree']['{0}'][0]['data']
     panel_cost_reward = weird_str_to_float(panel_cost_reward_str)
+
+    panel_waste_reward_str = output['values'][3]['InnerTree']['{0;0}'][0]['data']
     panel_waste_reward = weird_str_to_float(panel_waste_reward_str)
+
+    daylight_autonomty_reward_str = output['values'][4]['InnerTree']['{0;0;0}'][0]['data']
     daylight_autonomty_reward = weird_str_to_float(daylight_autonomty_reward_str)
 
     # Weighted reward from Grasshopper
@@ -89,7 +96,7 @@ def get_reward_gh(
         + str_wt * karamba_reward
         + cst_wt * panel_cost_reward
         + wst_wt * panel_waste_reward
-        + daylight_autonomty_reward
+        + day_wt * daylight_autonomty_reward
     )
 
     # Optional repulsor proximity penalty (0..repulsor_wt)

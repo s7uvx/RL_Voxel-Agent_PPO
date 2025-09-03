@@ -8,7 +8,7 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 # from sb3_contrib.common.maskable.evaluation import evaluate_policy  # optional
 
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback
 from gymnasium import wrappers
@@ -75,6 +75,8 @@ parser.add_argument('--grid', type=parse_grid, default='(5,5,5)',
                     help='Grid: int like 5 or tuple like 5,5,10 or (5,5,10)')
 parser.add_argument('--chk_freq', type=int, default=500,
                     help='Frequency of saving checkpoints (default: 500)')
+parser.add_argument('--timesteps', type=int, default=100000,
+                    help='Total environment steps to train (default: 100000)')
 args = parser.parse_args()
 
 GRID_PARAM = parse_grid(args.grid)
@@ -88,7 +90,8 @@ print("Using CPU for PPO training (recommended for MLP policies)")
 # Mask function for ActionMasker
 # ---------------------------
 def mask_fn(env):
-    return env.action_masks()
+    # return env.action_masks()
+    return env.unwrapped.action_masks()
 
 # ---------------------------
 # Vec env factory
@@ -96,19 +99,23 @@ def mask_fn(env):
 def make_single_env(rank: int = 0):
     def _thunk():
         # give each env a unique port if you scale n_envs
-        e = VoxelEnv(port=args.port + rank, grid_size=GRID_PARAM, device='cpu', str_wt=0.4, sun_wt=0.4, wst_wt=0.1, cst_wt=0.1)  # type: ignore[arg-type]
+        e = VoxelEnv(port=args.port + rank, grid_size=GRID_PARAM, device='cpu', str_wt=1.0, sun_wt=0.0, wst_wt=0.0, cst_wt=0.0, day_wt=0.0)  # type: ignore[arg-type]
         # wrap with the ActionMasker so the policy only samples valid actions
-        return ActionMasker(e, mask_fn)
+        e = wrappers.TimeLimit(env=e, max_episode_steps=256)
+        e = ActionMasker(e, mask_fn)
+        
+        return e
     return _thunk
 
 num_envs = max(1, args.n_envs)
 env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
+env = VecMonitor(env)
 
 # ---------------------------
 # PPO hyperparams
 # ---------------------------
-num_steps = 256          # rollout length per env 
-num_epochs = 30          # PPO epochs per update
+num_steps = 128          # rollout length per env 
+num_epochs = 5           # PPO epochs per update
 batch_size = 32          # must divide (num_steps * num_envs); 1024*k is always divisible by 256
 
 starting_step = 0
@@ -170,11 +177,11 @@ if args.new:
 # Training setup
 # ---------------------------
 print(f"Starting training from {starting_step} with {num_envs} parallel env(s) on CPU...")
-new_steps = num_steps * num_epochs
+total_steps = args.timesteps
 model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
 
 save_path = os.path.join(model_dir,
-                         f"maskable_ppo_voxel_{model_date_time}_{starting_step+new_steps}")
+                         f"maskable_ppo_voxel_{model_date_time}_{starting_step+total_steps}")
 
 checkpoint_callback = CheckpointCallback(
     save_freq=args.chk_freq,
@@ -186,7 +193,7 @@ checkpoint_callback = CheckpointCallback(
 # Train
 # ---------------------------
 model.learn(
-    total_timesteps=new_steps,
+    total_timesteps=total_steps,
     progress_bar=True,
     callback=checkpoint_callback,
     reset_num_timesteps=False  # <-- keep global step count
@@ -196,7 +203,7 @@ print("Training completed")
 # ---------------------------
 # Save the trained model
 # ---------------------------
-final_step = int(getattr(model, "num_timesteps", starting_step+new_steps))
+final_step = int(getattr(model, "num_timesteps", starting_step+total_steps))
 final_save_path = os.path.join(model_dir,
                                f"maskable_ppo_voxel_{model_date_time}_{final_step}")
 model.save(final_save_path)
@@ -207,7 +214,7 @@ print(f"Model saved as: {final_save_path}.zip")
 # ---------------------------
 print("Starting evaluation...")
 
-max_eval_steps = 3 * num_steps
+max_eval_steps = num_steps
 raw_eval_env = VoxelEnv(port=args.port, grid_size=GRID_PARAM, device='cpu')  # type: ignore[arg-type]
 raw_eval_env = ActionMasker(raw_eval_env, mask_fn)
 raw_eval_env = wrappers.TimeLimit(env=raw_eval_env, max_episode_steps=max_eval_steps * 2)
