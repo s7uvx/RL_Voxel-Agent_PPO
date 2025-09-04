@@ -3,12 +3,13 @@ import time
 import argparse
 import numpy as np
 import torch
+import math
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 # from sb3_contrib.common.maskable.evaluation import evaluate_policy  # optional
 
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback
 from gymnasium import wrappers
@@ -77,6 +78,10 @@ parser.add_argument('--chk_freq', type=int, default=500,
                     help='Frequency of saving checkpoints (default: 500)')
 parser.add_argument('--timesteps', type=int, default=100000,
                     help='Total environment steps to train (default: 100000)')
+parser.add_argument('--lr', type=float, default=3e-3, help='Initial learning rate')
+parser.add_argument('--lr_final', type=float, default=3e-5, help='Final learning rate at end of training')
+parser.add_argument('--lr_schedule', type=str, choices=['constant', 'linear', 'cosine'], default='cosine',
+                    help='LR schedule over progress_remaining (1→0)')
 args = parser.parse_args()
 
 GRID_PARAM = parse_grid(args.grid)
@@ -109,7 +114,10 @@ def make_single_env(rank: int = 0):
 
 num_envs = max(1, args.n_envs)
 env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
+# Log raw (unnormalized) episode rewards
 env = VecMonitor(env)
+# Normalize rewards seen by the agent (zero-mean, unit-variance)
+env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
 # ---------------------------
 # PPO hyperparams
@@ -125,6 +133,28 @@ os.makedirs(model_dir, exist_ok=True)
 os.makedirs(checkpoint_dir, exist_ok=True)
 
 # ---------------------------
+# Learning rate schedule
+# ---------------------------
+def _make_lr_schedule(kind: str, lr_start: float, lr_end: float):
+    if kind == 'constant':
+        return lambda progress_remaining: lr_start
+    if kind == 'linear':
+        # progress_remaining: 1 → 0, so lr: start → end
+        return lambda progress_remaining: lr_end + (lr_start - lr_end) * progress_remaining
+    if kind == 'cosine':
+        # smooth decay start → end
+        return lambda progress_remaining: lr_end + 0.5 * (lr_start - lr_end) * (1.0 + math.cos(math.pi * (1.0 - progress_remaining)))
+    return lambda progress_remaining: lr_start
+
+# Build schedule once
+lr_schedule = _make_lr_schedule(args.lr_schedule, args.lr, args.lr_final)
+norm_path = os.path.join(model_dir, "vecnormalize.pkl")
+# If resuming, load running stats
+if os.path.exists(norm_path):
+    env = VecNormalize.load(norm_path, env)
+    env.training = True
+    env.norm_reward = True
+# ---------------------------
 # Model loading
 # ---------------------------
 if args.checkpoint:
@@ -136,17 +166,16 @@ if args.checkpoint:
     print(f"Resuming from checkpoint: {latest_ckpt}")
     model_path = os.path.join(checkpoint_dir, latest_ckpt)
     model = MaskablePPO.load(model_path, env=env, device="cpu")
-    starting_step = int(getattr(model, "num_timesteps", 0))
-
+    # override lr schedule when resuming
+    model.lr_schedule = lr_schedule
 elif not args.new:
     existing_models = [f for f in os.listdir(model_dir) if f.endswith(".zip")]
     if existing_models:
-        latest_model = max(existing_models,
-                           key=lambda f: os.path.getmtime(os.path.join(model_dir, f)))
-        print(f"Loading saved model: {latest_model}")
-        model_path = os.path.join(model_dir, latest_model)
-        model = MaskablePPO.load(model_path, env=env, device="cpu")
-        starting_step = int(getattr(model, "num_timesteps", 0))
+        latest_model = os.path.splitext(sorted(existing_models, key=lambda x: os.path.getmtime(os.path.join(model_dir, x)))[-1])[0]
+        print(f"Loading existing MaskablePPO model: {latest_model}")
+        model = MaskablePPO.load(os.path.join(model_dir, latest_model), env=env, device='cpu')
+        starting_step = model._total_timesteps if hasattr(model, "_total_timesteps") else 0
+        model.lr_schedule = lr_schedule
     else:
         print("No saved models found. Starting fresh.")
         args.new = True
@@ -157,7 +186,7 @@ if args.new:
         "MlpPolicy",
         env,
         verbose=1,
-        learning_rate=3e-4,
+        learning_rate=lr_schedule,   # <-- schedule here
         gamma=0.99,
         n_steps=num_steps,
         batch_size=batch_size,
@@ -196,8 +225,13 @@ model.learn(
     total_timesteps=total_steps,
     progress_bar=True,
     callback=checkpoint_callback,
-    reset_num_timesteps=False  # <-- keep global step count
+    reset_num_timesteps=False,
+    tb_log_name=f"MaskablePPO_lr-{args.lr_schedule}"
 )
+
+# Save VecNormalize stats so evaluation uses the same scaling
+env.save(norm_path)
+print(f"Saved VecNormalize stats: {norm_path}")
 print("Training completed")
 
 # ---------------------------
@@ -215,10 +249,15 @@ print(f"Model saved as: {final_save_path}.zip")
 print("Starting evaluation...")
 
 max_eval_steps = num_steps
-raw_eval_env = VoxelEnv(port=args.port, grid_size=GRID_PARAM, device='cpu')  # type: ignore[arg-type]
-raw_eval_env = ActionMasker(raw_eval_env, mask_fn)
+raw_eval_env = VoxelEnv(port=args.port, grid_size=GRID_PARAM, device='cpu')
 raw_eval_env = wrappers.TimeLimit(env=raw_eval_env, max_episode_steps=max_eval_steps * 2)
-raw_eval_env = Monitor(raw_eval_env, allow_early_resets=True)
+raw_eval_env = ActionMasker(raw_eval_env, mask_fn)
+eval_env = DummyVecEnv([lambda: raw_eval_env])
+eval_env = VecMonitor(eval_env)
+if os.path.exists(norm_path):
+    eval_env = VecNormalize.load(norm_path, eval_env)
+    eval_env.training = False
+    eval_env.norm_reward = False  # report raw rewards
 
 output_folder = f"output_steps/model_{model_date_time}"
 os.makedirs(output_folder, exist_ok=True)
@@ -282,6 +321,7 @@ for step in range(max_eval_steps):
 
     if done:
         obs, info = raw_eval_env.reset()
+
 
 print(f"Exported voxel states to: {output_folder}")
 print(f"Tensorboard logs: ./ppo_voxel_tensorboard/")
