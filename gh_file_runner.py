@@ -99,6 +99,9 @@ def get_reward_gh(
         + day_wt * daylight_autonomty_reward
     )
 
+    # Optional: soft clamp to avoid extreme magnitudes that destabilize PPO
+    reward = float(np.clip(reward, -100.0, 100.0))
+
     # Optional repulsor proximity penalty (0..repulsor_wt)
     repulsor_penalty = 0.0
     try:
@@ -122,7 +125,6 @@ def get_reward_gh(
         # Be robust: never break training due to repulsor math
         repulsor_penalty = 0.0
 
-    # ✅ Log reward summary with facade info
     print(
         f"[REWARD] Cyclops: {sun_wt * cyclops_reward:.2f}, "
         f"Karamba: {str_wt * karamba_reward:.2f}, "
@@ -132,9 +134,5 @@ def get_reward_gh(
         f"Facade: cols {cols.tolist()}, rows {rows.tolist()}, daylight autonomy {daylight_autonomty_reward:.2f}"
     )
 
-    # except Exception as e:
-    #     print(f"[ERROR] Failed to evaluate GH definition: {e}")
-    #     reward = -0.2
 
-    gc.collect()
     return reward

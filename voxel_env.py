@@ -16,22 +16,15 @@ from gh_file_runner import get_reward_gh
 class VoxelEnv(Env):
     """
     Voxel placement environment with action masking, safety NO-OP action, and facade options.
-
-    Actions (combined per step):
-      - Voxel action (2N + 1 options): add/delete at each location, plus NO-OP
-      - Facade action (56 + 1 options): facade parameter adjustments, plus NO-FACADE
-
-    Combined action space is the cartesian product:
-      action_idx = voxel_idx * (56 + 1) + facade_idx  
-
-    Where:
-      N = gx * gy * gz (grid_size if int, or product of a 3D tuple)
-      voxel_idx in [0 .. 2N]   (2N is NO-OP)
-      facade_idx in [0 .. 56] (56 is NO-FACADE)
+    + Optional early DONE action to let the agent terminate an episode.
     """
     def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=7, step_penalty=0.0,
-                 num_repulsors: int = 2, sun_wt = 0.5, str_wt = 0.3, cst_wt = 0.1, wst_wt = 0.1, day_wt = 0.1, repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
-                 repulsor_provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]] = None):
+                 num_repulsors: int = 2, sun_wt = 0.5, str_wt = 0.3, cst_wt = 0.1, wst_wt = 0.1, day_wt = 0.1,
+                 repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
+                 repulsor_provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]] = None,
+                 early_done: bool = False,
+                 early_done_bonus: float = 0.0,
+                 early_done_min_voxels: float = 0.0):
         super(VoxelEnv, self).__init__()
         # Normalize grid_size to 3D dims (gx, gy, gz)
         if isinstance(grid_size, (list, tuple, np.ndarray)):
@@ -61,6 +54,36 @@ class VoxelEnv(Env):
         total_locations = int(self.gx * self.gy * self.gz)
         self.total_locations = total_locations
         self.NOOP_IDX = 2 * total_locations
+        self.FACADE_ACTIONS = 2 * 4 * 7  # 56 facade actions
+        self.voxel_actions_count = self.NOOP_IDX + 1
+        self.facade_actions_count = self.FACADE_ACTIONS + 1
+        self.NO_FACADE_IDX = self.FACADE_ACTIONS
+
+        # Early-done config
+        self.early_done = bool(early_done)
+        self.early_done_bonus = float(early_done_bonus)
+        # Allow user to give fraction (<=1) or absolute count (>1)
+        if early_done_min_voxels <= 1.0:
+            self.early_done_min_voxels = int(round(early_done_min_voxels * self.total_locations))
+        else:
+            self.early_done_min_voxels = int(early_done_min_voxels)
+
+        self._combo_action_count = self.voxel_actions_count * self.facade_actions_count
+        if self.early_done:
+            self.DONE_IDX = self._combo_action_count  # last index
+            self.action_space = spaces.Discrete(self._combo_action_count + 1)
+        else:
+            self.DONE_IDX = None
+            self.action_space = spaces.Discrete(self._combo_action_count)
+
+        self.episode_return = 0.0  # <-- INIT cumulative episode reward
+
+        # REMOVE duplicated block below (was overwriting action_space & early-done):
+        # self.FACADE_ACTIONS = 2 * 4 * 7
+        # self.voxel_actions_count = self.NOOP_IDX + 1
+        # self.facade_actions_count = self.FACADE_ACTIONS + 1
+        # self.NO_FACADE_IDX = self.FACADE_ACTIONS
+        # self.action_space = spaces.Discrete(self.voxel_actions_count * self.facade_actions_count)
         
         # Facade parameters: 2 parameters × 4 directions × 7 values = 56 actions
         self.FACADE_ACTIONS = 2 * 4 * 7  # 56 facade actions
@@ -159,14 +182,11 @@ class VoxelEnv(Env):
 
     def _decode_combined_action(self, action_idx: int):
         """
-        Split combined action index into its voxel and facade components.
-        Returns:
-          voxel_part: tuple[str, payload]
-              - "noop", (None, None, None)
-              - "add",  (x,y,z)
-              - "delete",(x,y,z)
-          facade_part: None if NO-FACADE, or ("facade", (param_name, direction_idx, value, direction_name))
+        Extended: if early_done enabled and action_idx == DONE_IDX -> DONE action.
         """
+        if self.early_done and action_idx == self.DONE_IDX:
+            return ("done", (None, None, None)), None
+
         voxel_idx = action_idx // self.facade_actions_count
         facade_idx = action_idx % self.facade_actions_count
 
@@ -233,20 +253,15 @@ class VoxelEnv(Env):
         Boolean mask for the combined action space (voxel × facade).
         Allowed iff both sub-actions are allowed. Guarantees at least one action.
         """
-        vmask = self.voxel_action_masks().astype(np.bool_, copy=False)
-        fmask = self.facade_action_masks().astype(np.bool_, copy=False)
-
-        combined = (vmask[:, None] & fmask[None, :]).reshape(-1).astype(np.bool_, copy=False)
-
-        # Fallback: guarantee at least one valid action (pure NOOP)
-        if not np.any(combined):
+        base = (self.voxel_action_masks()[:, None] & self.facade_action_masks()[None, :]).reshape(-1)
+        if not np.any(base):
             pure_noop_idx = self.NOOP_IDX * self.facade_actions_count + self.NO_FACADE_IDX
-            combined = np.zeros_like(combined, dtype=np.bool_)
-            combined[pure_noop_idx] = True
-            # Optional debug
-            # print("[MASK] All actions were masked; forcing pure NOOP available.")
-
-        return combined
+            base[:] = False
+            base[pure_noop_idx] = True
+        if self.early_done:
+            # Append DONE action (always allowed)
+            base = np.concatenate([base, np.array([True], dtype=np.bool_)])
+        return base
 
     def voxel_action_masks(self) -> np.ndarray:
         """
@@ -289,6 +304,7 @@ class VoxelEnv(Env):
         super().reset(seed=seed)
         rng = np.random.default_rng(seed)
         self.grid = np.zeros_like(self.grid, dtype=np.int32)
+        self.episode_return = 0.0  # <-- RESET cumulative reward
 
         # Episode bookkeeping
         self.step_count = 0
@@ -349,6 +365,8 @@ class VoxelEnv(Env):
             "repulsors": np.array(self.repulsors, dtype=np.int32) if self.repulsors else np.empty((0,3), dtype=np.int32),
             "facade_params": self.current_facade_params.copy()
         }
+        if self.early_done:
+            info["early_done_available"] = True
         return observation, info
 
     def set_repulsor_provider(self, provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]]):
@@ -390,6 +408,26 @@ class VoxelEnv(Env):
         return float(self.loop_penalty_scale * (c ** self.loop_penalty_power))
 
     def step(self, action_idx):
+        # Early-done intercept
+        if self.early_done and action_idx == self.DONE_IDX:
+            # Optional bonus if structural occupancy condition met
+            active_voxels = int(np.sum(self.grid))
+            condition_met = active_voxels >= self.early_done_min_voxels
+            bonus = self.early_done_bonus if condition_met else -abs(self.early_done_bonus)
+            reward = float(bonus)
+            self.episode_return += reward
+            observation = self.grid.flatten().astype(np.float32)
+            info = {
+                "early_done": True,
+                "episode_return": self.episode_return,
+                "active_voxels": active_voxels,
+                "bonus_applied": bonus,
+                "condition_met": condition_met
+            }
+            terminated = True
+            truncated = False
+            return observation, reward, terminated, truncated, info
+
         # Time/bookkeeping
         self.step_count += 1
         self._tick_cooldowns()
@@ -461,11 +499,13 @@ class VoxelEnv(Env):
         truncated = self.step_count >= self.max_steps
 
         observation = self.grid.flatten().astype(np.float32)
+        self.episode_return += reward
         info = {
             "epw_file": os.path.basename(self.current_epw or ""),
             "action_masks": self.action_masks(),
             "facade_params": self.current_facade_params.copy(),
-            "unstuck": unstuck
+            "unstuck": unstuck,
+            "episode_return": self.episode_return
         }
         return observation, reward, terminated, truncated, info
 

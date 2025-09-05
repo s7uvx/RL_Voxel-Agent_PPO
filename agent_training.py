@@ -82,6 +82,12 @@ parser.add_argument('--lr', type=float, default=3e-3, help='Initial learning rat
 parser.add_argument('--lr_final', type=float, default=3e-5, help='Final learning rate at end of training')
 parser.add_argument('--lr_schedule', type=str, choices=['constant', 'linear', 'cosine'], default='cosine',
                     help='LR schedule over progress_remaining (1→0)')
+parser.add_argument('--early-done', action='store_true', default=False,
+                    help='Enable an explicit DONE action for early termination')
+parser.add_argument('--early-done-bonus', type=float, default=0.0,
+                    help='Bonus (or penalty if negative) when DONE is used meeting min occupancy')
+parser.add_argument('--early-done-min-voxels', type=float, default=0.1,
+                    help='Minimum fraction (<=1) or absolute count (>1) of active voxels required for DONE bonus')
 args = parser.parse_args()
 
 GRID_PARAM = parse_grid(args.grid)
@@ -103,9 +109,19 @@ def mask_fn(env):
 # ---------------------------
 def make_single_env(rank: int = 0):
     def _thunk():
-        # give each env a unique port if you scale n_envs
-        e = VoxelEnv(port=args.port + rank, grid_size=GRID_PARAM, device='cpu', str_wt=1.0, sun_wt=0.0, wst_wt=0.0, cst_wt=0.0, day_wt=0.0)  # type: ignore[arg-type]
-        # wrap with the ActionMasker so the policy only samples valid actions
+        e = VoxelEnv(
+            port=args.port + rank,
+            grid_size=GRID_PARAM,
+            device='cpu',
+            str_wt=2.0,
+            sun_wt=0.4,
+            wst_wt=0.005,
+            cst_wt=0.05,
+            day_wt=0.4,
+            early_done=args.early_done,
+            early_done_bonus=args.early_done_bonus,
+            early_done_min_voxels=args.early_done_min_voxels
+        )  # type: ignore[arg-type]
         e = wrappers.TimeLimit(env=e, max_episode_steps=256)
         e = ActionMasker(e, mask_fn)
         
@@ -205,7 +221,8 @@ if args.new:
 # ---------------------------
 # Training setup
 # ---------------------------
-print(f"Starting training from {starting_step} with {num_envs} parallel env(s) on CPU...")
+print(f"Starting training from {starting_step} with {num_envs} parallel env(s) "
+      f"({'early-done ON' if args.early_done else 'early-done OFF'}) on CPU...")
 total_steps = args.timesteps
 model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
 
@@ -303,6 +320,9 @@ for step in range(max_eval_steps):
         }
         print(f"Step {step}: Action Index: {action_idx} | Action: FACADE {param_name}[{direction_name}] = {value} "
               f"| Total Actions: {total_actions} | Reward: {reward}")
+    elif action_type == "done":
+        print(f"Step {step}: Action Index: {action_idx} | Action: DONE | Reward: {reward}")
+        action_info["early_done"] = True
     else:
         print(f"Step {step}: Action Index: {action_idx} | Action: INVALID "
               f"| Total Actions: {total_actions} | Reward: {reward}")
