@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import torch
 import math
+import psutil  # process management for locating/killing PowerShell
 
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
@@ -11,7 +12,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
 from gymnasium import wrappers
 
 from voxel_env import VoxelEnv, export_voxel_grid
@@ -40,28 +41,117 @@ def parse_grid(grid_str: str):
 # Enhanced export function with EPW and facade parameters
 def export_voxel_grid_enhanced(grid, filename, epw_file=None, facade_params=None, action_info=None):
     """Export voxel grid with additional metadata"""
+    def _to_serializable(o):
+        import numpy as _np
+        if isinstance(o, _np.ndarray):
+            return o.tolist()
+        if isinstance(o, (_np.generic,)):
+            return o.item()
+        if isinstance(o, dict):
+            return {k: _to_serializable(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple, set)):
+            return [_to_serializable(x) for x in o]
+        return o
+
     data = {
         "voxels": grid.tolist(),
         "epw_file": os.path.basename(epw_file) if epw_file else None,
-        "facade_params": {}
+        "facade_params": {},
     }
 
-    # Add facade parameters if available
     if facade_params:
         for key, value in facade_params.items():
-            if hasattr(value, 'tolist'):
-                data["facade_params"][key] = value.tolist()
-            else:
-                data["facade_params"][key] = value
+            data["facade_params"][key] = _to_serializable(value)
 
-    # Add action information if available
     if action_info:
-        data["action_info"] = action_info
+        data["action_info"] = _to_serializable(action_info)
 
     with open(filename, 'w') as f:
         import json
-        json.dump(data, f, indent=2)
+        json.dump(_to_serializable(data), f, indent=2)
 
+
+
+def _locate_ps_process(script_path: str):
+    sp_norm = os.path.normcase(script_path)
+    for p in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
+        try:
+            cmd = p.info.get("cmdline") or []
+            if any(os.path.normcase(script_path) in os.path.normcase(c) for c in cmd):
+                return p
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return None
+
+def _start_rhino_new_window(script_path: str):
+    if not os.path.exists(script_path):
+        print(f"[RhinoCompute] Script not found: {script_path}")
+        return None
+    try:
+        # Launch a new PowerShell window using os.startfile (opens with associated handler)
+        # os.startfile(script_path)  # NOTE: no direct PID returned
+        os.system(f"start powershell {script_path}")
+        time.sleep(10.0)  # Increased wait time for Rhino to fully start (was 1.5)
+        proc = _locate_ps_process(script_path)
+        if proc:
+            print(f"[RhinoCompute] Started PowerShell window (PID={proc.pid}) for {script_path}")
+        else:
+            print("[RhinoCompute] Warning: Could not locate PowerShell process after start.")
+        return proc
+    except Exception as e:
+        print(f"[RhinoCompute] Failed to start: {e}")
+        return None
+
+def _stop_rhino(proc):
+    if proc is None:
+        return
+    try:
+        if proc.is_running():
+            print(f"[RhinoCompute] Terminating PID={proc.pid} ...")
+            for child in proc.children(recursive=True):
+                try: child.terminate()
+                except Exception: pass
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except psutil.TimeoutExpired:
+                print("[RhinoCompute] Forcing kill...")
+                proc.kill()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+
+class RhinoRestartCallback(BaseCallback):
+    """
+    Opens start_rhino_compute.ps1 in a new PowerShell window (os.startfile) and
+    restarts it every RHINO_RESTART_INTERVAL timesteps.
+    """
+    def __init__(self, script_path: str, restart_interval: int, verbose: int = 0):
+        super().__init__(verbose)
+        self.script_path = script_path
+        self.restart_interval = restart_interval
+        self._proc = None
+        self._next_restart = restart_interval
+        self._cycle = 0
+
+    def _init_callback(self):
+        self._proc = _start_rhino_new_window(self.script_path)
+
+    def _on_step(self) -> bool:
+        # Only check for restart at the end of complete rollouts
+        # num_timesteps tracks total timesteps across all environments
+        if self.num_timesteps >= self._next_restart and self.num_timesteps % self.restart_interval == 0:
+            self._cycle += 1
+            if self.verbose:
+                print(f"[RhinoCompute] Restart #{self._cycle} at timesteps={self.num_timesteps}")
+            _stop_rhino(self._proc)
+            time.sleep(5.0)  # Give time for process to fully terminate
+            self._proc = _start_rhino_new_window(self.script_path)
+            self._next_restart = self.num_timesteps + self.restart_interval
+        return True
+
+    def _on_training_end(self):
+        _stop_rhino(self._proc)
+        self._proc = None
 # ---------------------------
 # CLI args
 # ---------------------------
@@ -76,8 +166,8 @@ parser.add_argument('--grid', type=parse_grid, default='(5,5,5)',
                     help='Grid: int like 5 or tuple like 5,5,10 or (5,5,10)')
 parser.add_argument('--chk_freq', type=int, default=500,
                     help='Frequency of saving checkpoints (default: 500)')
-parser.add_argument('--timesteps', type=int, default=100000,
-                    help='Total environment steps to train (default: 100000)')
+parser.add_argument('--timesteps', type=int, default=256,
+                    help='Total environment steps to train (default: 256)')
 parser.add_argument('--lr', type=float, default=3e-3, help='Initial learning rate')
 parser.add_argument('--lr_final', type=float, default=3e-5, help='Final learning rate at end of training')
 parser.add_argument('--lr_schedule', type=str, choices=['constant', 'linear', 'cosine'], default='cosine',
@@ -141,6 +231,10 @@ env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 num_steps = 128          # rollout length per env 
 num_epochs = 5           # PPO epochs per update
 batch_size = 32          # must divide (num_steps * num_envs); 1024*k is always divisible by 256
+
+RHINO_PS1 = os.path.join(os.getcwd(), "start_rhino_compute.ps1")
+# Make restart interval a multiple of episode length (256 steps)
+RHINO_RESTART_INTERVAL = 1000//num_steps * num_steps  # 1024 timesteps = 4 episodes
 
 starting_step = 0
 model_dir = os.path.join(os.getcwd(), 'models', 'PPO')
@@ -235,13 +329,72 @@ checkpoint_callback = CheckpointCallback(
     name_prefix=f"maskable_ppo_voxel_{model_date_time}"
 )
 
+# --- ADDED: combine with Rhino restart callback ---
+rhino_callback = RhinoRestartCallback(
+    script_path=RHINO_PS1,
+    restart_interval=RHINO_RESTART_INTERVAL,
+    verbose=1
+)
+
+# Add this class before the training setup
+class LastEpisodeCallback(BaseCallback):
+    """Callback to capture actions from the last episode of training"""
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+        self.last_episode_actions = []
+        self.last_episode_rewards = []
+        self.last_episode_infos = []
+        self.current_episode_actions = []
+        self.current_episode_rewards = []
+        self.current_episode_infos = []
+        self.episode_count = 0
+
+    def _on_step(self) -> bool:
+        # Get the action that was just taken
+        if hasattr(self.locals, 'actions') and self.locals['actions'] is not None:
+            action = self.locals['actions'][0] if isinstance(self.locals['actions'], (list, np.ndarray)) else self.locals['actions']
+            self.current_episode_actions.append(int(action))
+        
+        # Get reward and info
+        if hasattr(self.locals, 'rewards') and self.locals['rewards'] is not None:
+            reward = self.locals['rewards'][0] if isinstance(self.locals['rewards'], (list, np.ndarray)) else self.locals['rewards']
+            self.current_episode_rewards.append(float(reward))
+        
+        if hasattr(self.locals, 'infos') and self.locals['infos'] is not None:
+            info = self.locals['infos'][0] if isinstance(self.locals['infos'], list) else self.locals['infos']
+            self.current_episode_infos.append(info)
+
+        # Check if episode ended
+        if hasattr(self.locals, 'dones') and self.locals['dones'] is not None:
+            done = self.locals['dones'][0] if isinstance(self.locals['dones'], (list, np.ndarray)) else self.locals['dones']
+            if done:
+                # Episode ended, save the actions
+                self.last_episode_actions = self.current_episode_actions.copy()
+                self.last_episode_rewards = self.current_episode_rewards.copy()
+                self.last_episode_infos = self.current_episode_infos.copy()
+                self.episode_count += 1
+                
+                # Reset for next episode
+                self.current_episode_actions = []
+                self.current_episode_rewards = []
+                self.current_episode_infos = []
+                
+                if self.verbose > 0:
+                    print(f"[LastEpisode] Captured episode #{self.episode_count} with {len(self.last_episode_actions)} actions")
+        
+        return True
+
+# Add the callback to the combined callback list
+last_episode_callback = LastEpisodeCallback(verbose=1)
+
+combined_callback = CallbackList([checkpoint_callback, rhino_callback, last_episode_callback])
 # ---------------------------
 # Train
 # ---------------------------
 model.learn(
     total_timesteps=total_steps,
     progress_bar=True,
-    callback=checkpoint_callback,
+    callback=combined_callback,  # CHANGED: was checkpoint_callback
     reset_num_timesteps=False,
     tb_log_name=f"MaskablePPO_lr-{args.lr_schedule}"
 )
@@ -261,88 +414,72 @@ model.save(final_save_path)
 print(f"Model saved as: {final_save_path}.zip")
 
 # ---------------------------
-# Evaluation
+# Output actions from last training episode
 # ---------------------------
-print("Starting evaluation...")
+print("Outputting actions from the last training episode...")
 
-max_eval_steps = num_steps
-raw_eval_env = VoxelEnv(port=args.port, grid_size=GRID_PARAM, device='cpu')
-raw_eval_env = wrappers.TimeLimit(env=raw_eval_env, max_episode_steps=max_eval_steps * 2)
-raw_eval_env = ActionMasker(raw_eval_env, mask_fn)
-eval_env = DummyVecEnv([lambda: raw_eval_env])
-eval_env = VecMonitor(eval_env)
-if os.path.exists(norm_path):
-    eval_env = VecNormalize.load(norm_path, eval_env)
-    eval_env.training = False
-    eval_env.norm_reward = False  # report raw rewards
-
-output_folder = f"output_steps/model_{model_date_time}"
-os.makedirs(output_folder, exist_ok=True)
-
-obs, info = raw_eval_env.reset()
-print("Exporting voxel states for visualization...")
-
-for step in range(max_eval_steps):
-    current_mask = raw_eval_env.unwrapped.action_masks()  # type: ignore[attr-defined]
-    action_idx, _states = model.predict(obs, deterministic=True, action_masks=current_mask)
-
-    obs, reward, terminated, truncated, info = raw_eval_env.step(action_idx)
-    done = bool(terminated or truncated)
-
-    voxel_part, facade_part = raw_eval_env.unwrapped._decode_combined_action(int(action_idx))  # <-- patched
-    action_type, coords_or_params = voxel_part
-    total_actions = raw_eval_env.action_space.n  # type: ignore[attr-defined]
-
-    action_info = {
-        "step": step,
-        "action_idx": int(action_idx),
-        "action_type": action_type,
-        "reward": float(reward),
-        "terminated": bool(terminated),
-        "truncated": bool(truncated)
+if last_episode_callback.last_episode_actions:
+    output_folder = f"output_steps/model_{model_date_time}"
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Get the unwrapped environment for action decoding
+    dummy_vec = env.venv.venv              # DummyVecEnv
+    action_masker_env = dummy_vec.envs[0]  # ActionMasker
+    inner_env = action_masker_env.unwrapped
+    
+    print(f"Exporting {len(last_episode_callback.last_episode_actions)} actions from last training episode...")
+    
+    # Create a summary of the episode
+    episode_summary = {
+        "total_steps": len(last_episode_callback.last_episode_actions),
+        "total_reward": sum(last_episode_callback.last_episode_rewards),
+        "episode_number": last_episode_callback.episode_count,
+        "actions": []
     }
+    
+    for step, (action_idx, reward) in enumerate(zip(last_episode_callback.last_episode_actions, last_episode_callback.last_episode_rewards)):
+        voxel_part, facade_part = inner_env._decode_combined_action(action_idx)
+        action_type, coords_or_params = voxel_part
 
-    if action_type in ["add", "delete"]:
-        x, y, z = coords_or_params
-        action_info["coordinates"] = [int(x), int(y), int(z)]
-        print(f"Step {step}: Action Index: {action_idx} | Action: {action_type.upper()} "
-              f"at ({x},{y},{z}) | Total Actions: {total_actions} | Reward: {reward}")
-    elif action_type == "noop":
-        print(f"Step {step}: Action Index: {action_idx} | Action: NOOP "
-              f"| Total Actions: {total_actions} | Reward: {reward}")
-    elif facade_part is not None:
-        _, (param_name, direction_idx, value, direction_name) = facade_part
-        action_info["facade_change"] = {
-            "parameter": param_name,
-            "direction": direction_name,
-            "direction_idx": int(direction_idx),
-            "value": int(value)
+        action_info = {
+            "step": step,
+            "action_idx": action_idx,
+            "action_type": action_type,
+            "reward": reward
         }
-        print(f"Step {step}: Action Index: {action_idx} | Action: FACADE {param_name}[{direction_name}] = {value} "
-              f"| Total Actions: {total_actions} | Reward: {reward}")
-    elif action_type == "done":
-        print(f"Step {step}: Action Index: {action_idx} | Action: DONE | Reward: {reward}")
-        action_info["early_done"] = True
-    else:
-        print(f"Step {step}: Action Index: {action_idx} | Action: INVALID "
-              f"| Total Actions: {total_actions} | Reward: {reward}")
 
-    if step % 10 == 0:
-        raw_eval_env.unwrapped.render()
+        if action_type in ["add", "delete"]:
+            x, y, z = map(int, coords_or_params)
+            action_info["coordinates"] = [x, y, z]
+            print(f"Step {step}: {action_type.upper()} ({x},{y},{z}) | idx={action_idx} | reward={reward:.4f}")
+        elif action_type == "done":
+            action_info["early_termination"] = True
+            print(f"Step {step}: EARLY DONE | idx={action_idx} | reward={reward:.4f}")
+        elif facade_part is not None:
+            _, (param_name, direction_idx, value, direction_name) = facade_part
+            action_info["facade_change"] = {
+                "parameter": param_name,
+                "direction": direction_name,
+                "direction_idx": int(direction_idx),
+                "value": int(value)
+            }
+            print(f"Step {step}: FACADE {param_name}[{direction_name}]={value} | idx={action_idx} | reward={reward:.4f}")
+        elif action_type == "noop":
+            print(f"Step {step}: NOOP | idx={action_idx} | reward={reward:.4f}")
+        else:
+            print(f"Step {step}: UNKNOWN | idx={action_idx} | reward={reward:.4f}")
+        
+        episode_summary["actions"].append(action_info)
+    
+    # Save episode summary
+    summary_file = os.path.join(output_folder, "last_episode_summary.json")
+    with open(summary_file, 'w') as f:
+        json.dump(episode_summary, f, indent=2)
+    
+    print(f"Last training episode summary saved to: {summary_file}")
+    print(f"Episode had {len(last_episode_callback.last_episode_actions)} steps with total reward: {sum(last_episode_callback.last_episode_rewards):.4f}")
+else:
+    print("No episode data captured during training.")
 
-    filename = os.path.join(output_folder, f"step_{step:03}.json")
-    export_voxel_grid_enhanced(
-        raw_eval_env.unwrapped.grid,  # type: ignore[attr-defined]
-        filename,
-        epw_file=raw_eval_env.unwrapped.current_epw,  # type: ignore[attr-defined]
-        facade_params=raw_eval_env.unwrapped.current_facade_params,  # type: ignore[attr-defined]
-        action_info=action_info
-    )
-
-    if done:
-        obs, info = raw_eval_env.reset()
-
-
-print(f"Exported voxel states to: {output_folder}")
-print(f"Tensorboard logs: ./ppo_voxel_tensorboard/")
-print(f"Action space (masked at runtime, includes NO-OP): {env.action_space}")
+print("Tensorboard logs: ./ppo_voxel_tensorboard/")
+print(f"Action space: {inner_env.action_space}")

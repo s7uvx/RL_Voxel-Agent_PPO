@@ -399,6 +399,13 @@ class VoxelEnv(Env):
         if clear_toggles:
             self._toggle_counts.clear()
 
+    def reset_action_mask(self, clear_cooldowns: bool = True, clear_toggles: bool = True):
+        """
+        Public helper to clear internal restrictions so the next call to action_masks()
+        recomputes from current grid without cooldown/toggle penalties.
+        """
+        self._reset_action_restrictions(clear_cooldowns=clear_cooldowns, clear_toggles=clear_toggles)
+
     def _toggle_penalty(self, x: int, y: int, z: int) -> float:
         """Increase per-voxel toggle counter and return penalty."""
         key = (int(x), int(y), int(z))
