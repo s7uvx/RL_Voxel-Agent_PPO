@@ -24,7 +24,8 @@ class VoxelEnv(Env):
                  save_actions: bool = False,
                  actions_output_dir: str = "episode_actions",
                  export_last_epoch_episode: bool = False,
-                 model_name: str = "model"):
+                 model_name: str = "model",
+                 log_actions_every: int = 100):
         super(VoxelEnv, self).__init__()
         # Normalize grid_size to 3D dims (gx, gy, gz)
         if isinstance(grid_size, (list, tuple, np.ndarray)):
@@ -148,6 +149,7 @@ class VoxelEnv(Env):
         # Action tracking for episode output
         self.save_actions = save_actions
         self.actions_output_dir = actions_output_dir
+        self.log_actions_every = max(1, log_actions_every)  # Ensure at least 1
         self.current_episode_actions = []
         self.current_episode_rewards = []
         self.current_episode_infos = []
@@ -317,10 +319,11 @@ class VoxelEnv(Env):
         if self.save_actions and self.current_episode_actions:
             self._save_episode_actions()
         
-        # Reset action tracking for new episode
-        self.current_episode_actions = []
-        self.current_episode_rewards = []
-        self.current_episode_infos = []
+        # Reset action tracking for new episode (always track if save_actions is enabled)
+        if self.save_actions:
+            self.current_episode_actions = []
+            self.current_episode_rewards = []
+            self.current_episode_infos = []
         self.episode_count += 1
         
         super().reset(seed=seed)
@@ -727,6 +730,21 @@ class VoxelEnv(Env):
         if not self.save_actions and not (self.export_last_epoch_episode and self.is_last_episode_of_epoch):
             return
         
+        def _to_serializable(obj):
+            """Convert numpy types and other non-serializable objects to Python native types"""
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {k: _to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [_to_serializable(x) for x in obj]
+            else:
+                return obj
+        
         try:
             # Increment global step counter
             self.step_count_global += 1
@@ -737,11 +755,11 @@ class VoxelEnv(Env):
             
             # Create action info similar to output_steps format
             action_info = {
-                "step": self.step_count_global,
-                "action_idx": action_idx,
-                "action_type": action_type,
-                "reward": reward,
-                "done": done
+                "step": int(self.step_count_global),
+                "action_idx": int(action_idx),
+                "action_type": str(action_type),
+                "reward": float(reward),
+                "done": bool(done)
             }
             
             # Add specific action details
@@ -749,7 +767,8 @@ class VoxelEnv(Env):
                 try:
                     if isinstance(coords_or_params, (list, tuple)) and len(coords_or_params) >= 3:
                         x, y, z = coords_or_params[:3]
-                        action_info["coordinates"] = [int(x), int(y), int(z)]  # type: ignore
+                        if x is not None and y is not None and z is not None:
+                            action_info["coordinates"] = [int(x), int(y), int(z)]
                 except (ValueError, TypeError, IndexError):
                     pass  # Skip if coordinates can't be converted
             elif action_type == "done":
@@ -759,8 +778,8 @@ class VoxelEnv(Env):
             if facade_part is not None:
                 _, (param_name, direction_idx, value, direction_name) = facade_part
                 action_info["facade_change"] = {
-                    "parameter": param_name,
-                    "direction": direction_name,
+                    "parameter": str(param_name),
+                    "direction": str(direction_name),
                     "direction_idx": int(direction_idx),
                     "value": int(value)
                 }
@@ -773,7 +792,7 @@ class VoxelEnv(Env):
                     "cols": self.current_facade_params["cols"].tolist(),
                     "rows": self.current_facade_params["rows"].tolist()
                 },
-                "action_info": action_info
+                "action_info": _to_serializable(action_info)
             }
             
             # Save to regular actions output directory
@@ -782,7 +801,7 @@ class VoxelEnv(Env):
                 step_filepath = os.path.join(self.actions_output_dir, step_filename)
                 
                 with open(step_filepath, 'w') as f:
-                    json.dump(step_data, f, indent=2)
+                    json.dump(_to_serializable(step_data), f, indent=2)
                 
                 print(f"[STEP_SAVE] 💾 Saved step {self.step_count_global}: {action_type} -> {step_filepath}")
             
@@ -792,7 +811,7 @@ class VoxelEnv(Env):
                 epoch_step_filepath = os.path.join(self.epoch_step_export_dir, epoch_step_filename)
                 
                 with open(epoch_step_filepath, 'w') as f:
-                    json.dump(step_data, f, indent=2)
+                    json.dump(_to_serializable(step_data), f, indent=2)
                 
                 print(f"[EPOCH_EXPORT] 📊 Saved epoch step {self.step_count}: {action_type} -> {epoch_step_filepath}")
             
@@ -804,7 +823,28 @@ class VoxelEnv(Env):
         if not self.current_episode_actions:
             return
         
+        # Check if we should save this episode based on frequency
+        if self.log_actions_every == 0 or (self.episode_count % self.log_actions_every != 0):
+            if self.log_actions_every > 0:
+                print(f"[EPISODE] 📝 Episode {self.episode_count} - skipping action log (saving every {self.log_actions_every} episodes)")
+            return
+        
         try:
+            def _to_serializable(obj):
+                """Convert numpy types and other non-serializable objects to Python native types"""
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                elif isinstance(obj, np.floating):
+                    return float(obj)
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, dict):
+                    return {k: _to_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, (list, tuple)):
+                    return [_to_serializable(x) for x in obj]
+                else:
+                    return obj
+            
             # Create episode summary
             episode_data = {
                 "episode_number": self.episode_count,
@@ -836,7 +876,8 @@ class VoxelEnv(Env):
                 if action_type in ["add", "delete"] and coords_or_params is not None:
                     try:
                         x, y, z = coords_or_params
-                        action_info["coordinates"] = [int(x), int(y), int(z)]  # type: ignore
+                        if x is not None and y is not None and z is not None:
+                            action_info["coordinates"] = [int(x), int(y), int(z)]
                     except (ValueError, TypeError, IndexError):
                         pass  # Skip if coordinates can't be converted
                 elif action_type == "done":
@@ -872,7 +913,7 @@ class VoxelEnv(Env):
             filepath = os.path.join(episode_subfolder, filename)
             
             with open(filepath, 'w') as f:
-                json.dump(episode_data, f, indent=2)
+                json.dump(_to_serializable(episode_data), f, indent=2)
             
             print(f"[EPISODE] 💾 Saved episode {self.episode_count} actions to: {filepath}")
             print(f"[EPISODE] 📊 {len(self.current_episode_actions)} steps, total reward: {sum(self.current_episode_rewards):.4f}")
@@ -923,9 +964,24 @@ class VoxelEnv(Env):
 
 
 def export_voxel_grid(grid, filename):
+    def _to_serializable(obj):
+        """Convert numpy types and other non-serializable objects to Python native types"""
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: _to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [_to_serializable(x) for x in obj]
+        else:
+            return obj
+    
     data = {"voxels": grid.tolist()}
     with open(filename, 'w') as f:
-        json.dump(data, f)
+        json.dump(_to_serializable(data), f)
 
 
 class VectorizedVoxelEnv:
