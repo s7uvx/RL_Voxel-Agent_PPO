@@ -1,17 +1,13 @@
 import numpy as np
 import os
 import json
-import torch
 import time
+import torch
 from gymnasium import Env, spaces
 import compute_rhino3d.Util
-import compute_rhino3d.Grasshopper as gh
-import gc
 from typing import Deque, Tuple, cast, Callable, Iterable, Sequence, Optional
-from collections import defaultdict  # added
 
 from gh_file_runner import get_reward_gh
-
 
 class VoxelEnv(Env):
     """
@@ -24,7 +20,11 @@ class VoxelEnv(Env):
                  repulsor_provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]] = None,
                  early_done: bool = False,
                  early_done_bonus: float = 0.0,
-                 early_done_min_voxels: float = 0.0):
+                 early_done_min_voxels: float = 0.0,
+                 save_actions: bool = False,
+                 actions_output_dir: str = "episode_actions",
+                 export_last_epoch_episode: bool = False,
+                 model_name: str = "model"):
         super(VoxelEnv, self).__init__()
         # Normalize grid_size to 3D dims (gx, gy, gz)
         if isinstance(grid_size, (list, tuple, np.ndarray)):
@@ -78,13 +78,6 @@ class VoxelEnv(Env):
 
         self.episode_return = 0.0  # <-- INIT cumulative episode reward
 
-        # REMOVE duplicated block below (was overwriting action_space & early-done):
-        # self.FACADE_ACTIONS = 2 * 4 * 7
-        # self.voxel_actions_count = self.NOOP_IDX + 1
-        # self.facade_actions_count = self.FACADE_ACTIONS + 1
-        # self.NO_FACADE_IDX = self.FACADE_ACTIONS
-        # self.action_space = spaces.Discrete(self.voxel_actions_count * self.facade_actions_count)
-        
         # Facade parameters: 2 parameters × 4 directions × 7 values = 56 actions
         self.FACADE_ACTIONS = 2 * 4 * 7  # 56 facade actions
 
@@ -151,6 +144,25 @@ class VoxelEnv(Env):
 
         self.current_epw = None
         self.repulsors = []
+
+        # Action tracking for episode output
+        self.save_actions = save_actions
+        self.actions_output_dir = actions_output_dir
+        self.current_episode_actions = []
+        self.current_episode_rewards = []
+        self.current_episode_infos = []
+        self.episode_count = 0
+        self.step_count_global = 0  # Global step counter across all episodes
+        
+        # Epoch-based step export settings
+        self.export_last_epoch_episode = export_last_epoch_episode
+        self.model_name = model_name
+        self.current_epoch = 0
+        self.is_last_episode_of_epoch = False
+        self.epoch_step_export_dir = None
+        
+        if self.save_actions:
+            os.makedirs(self.actions_output_dir, exist_ok=True)
 
     # ---------------------------
     # Utilities
@@ -301,6 +313,16 @@ class VoxelEnv(Env):
         return mask
 
     def reset(self, seed=None, options=None):
+        # Save previous episode actions if we have any and save_actions is enabled
+        if self.save_actions and self.current_episode_actions:
+            self._save_episode_actions()
+        
+        # Reset action tracking for new episode
+        self.current_episode_actions = []
+        self.current_episode_rewards = []
+        self.current_episode_infos = []
+        self.episode_count += 1
+        
         super().reset(seed=seed)
         rng = np.random.default_rng(seed)
         self.grid = np.zeros_like(self.grid, dtype=np.int32)
@@ -377,6 +399,26 @@ class VoxelEnv(Env):
         """
         self.repulsor_provider = provider
 
+    def set_epoch_info(self, epoch: int, is_last_episode: bool = False):
+        """Set current epoch information for step export tracking"""
+        self.current_epoch = epoch
+        self.is_last_episode_of_epoch = is_last_episode
+        
+        if self.export_last_epoch_episode and is_last_episode:
+            import time
+            model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
+            self.epoch_step_export_dir = f"output_steps/{self.model_name}_{model_date_time}_epoch_{epoch}"
+            os.makedirs(self.epoch_step_export_dir, exist_ok=True)
+            print(f"[EPOCH_EXPORT] 📁 Prepared step export directory: {self.epoch_step_export_dir}")
+        else:
+            self.epoch_step_export_dir = None
+
+    def enable_epoch_step_export(self, model_name: str = "model"):
+        """Enable step export for last episode of each epoch"""
+        self.export_last_epoch_episode = True
+        self.model_name = model_name
+        print(f"[EPOCH_EXPORT] ✅ Enabled epoch step export for model: {model_name}")
+
     def _tick_cooldowns(self):
         # decrement, then purge zeros
         for d in (self._added_cooldown, self._deleted_cooldown):
@@ -415,6 +457,10 @@ class VoxelEnv(Env):
         return float(self.loop_penalty_scale * (c ** self.loop_penalty_power))
 
     def step(self, action_idx):
+        # Store the action at the beginning of step
+        if self.save_actions:
+            self.current_episode_actions.append(int(action_idx))
+        
         # Early-done intercept
         if self.early_done and action_idx == self.DONE_IDX:
             # Optional bonus if structural occupancy condition met
@@ -431,6 +477,14 @@ class VoxelEnv(Env):
                 "bonus_applied": bonus,
                 "condition_met": condition_met
             }
+            
+            # Store reward and info for action tracking
+            if self.save_actions:
+                self.current_episode_rewards.append(float(reward))
+                self.current_episode_infos.append(info.copy())
+                # Save actions when episode ends
+                self._save_episode_actions()
+            
             terminated = True
             truncated = False
             return observation, reward, terminated, truncated, info
@@ -514,6 +568,18 @@ class VoxelEnv(Env):
             "unstuck": unstuck,
             "episode_return": self.episode_return
         }
+        
+        # Store reward and info after processing
+        if self.save_actions:
+            self.current_episode_rewards.append(float(reward))
+            self.current_episode_infos.append(info.copy())
+            # Save individual step file showing what was passed to Grasshopper
+            self._save_step_file(action_idx, reward, terminated or truncated)
+        
+        # If episode is ending (terminated or truncated), save actions
+        if self.save_actions and (terminated or truncated):
+            self._save_episode_actions()
+        
         return observation, reward, terminated, truncated, info
 
     def _safe_reward(self, r):
@@ -655,6 +721,169 @@ class VoxelEnv(Env):
                         q.append((nx, ny, nz))
 
         return len(visited) == total_active
+
+    def _save_step_file(self, action_idx, reward, done):
+        """Save individual step file showing what was passed to Grasshopper"""
+        if not self.save_actions and not (self.export_last_epoch_episode and self.is_last_episode_of_epoch):
+            return
+        
+        try:
+            # Increment global step counter
+            self.step_count_global += 1
+            
+            # Decode the action to get details
+            voxel_part, facade_part = self._decode_combined_action(action_idx)
+            action_type, coords_or_params = voxel_part
+            
+            # Create action info similar to output_steps format
+            action_info = {
+                "step": self.step_count_global,
+                "action_idx": action_idx,
+                "action_type": action_type,
+                "reward": reward,
+                "done": done
+            }
+            
+            # Add specific action details
+            if action_type in ["add", "delete"] and coords_or_params is not None:
+                try:
+                    if isinstance(coords_or_params, (list, tuple)) and len(coords_or_params) >= 3:
+                        x, y, z = coords_or_params[:3]
+                        action_info["coordinates"] = [int(x), int(y), int(z)]  # type: ignore
+                except (ValueError, TypeError, IndexError):
+                    pass  # Skip if coordinates can't be converted
+            elif action_type == "done":
+                action_info["early_termination"] = True
+            
+            # Add facade information if present
+            if facade_part is not None:
+                _, (param_name, direction_idx, value, direction_name) = facade_part
+                action_info["facade_change"] = {
+                    "parameter": param_name,
+                    "direction": direction_name,
+                    "direction_idx": int(direction_idx),
+                    "value": int(value)
+                }
+            
+            # Create data structure matching output_steps format
+            step_data = {
+                "voxels": self.grid.tolist(),
+                "epw_file": os.path.basename(self.current_epw) if self.current_epw else None,
+                "facade_params": {
+                    "cols": self.current_facade_params["cols"].tolist(),
+                    "rows": self.current_facade_params["rows"].tolist()
+                },
+                "action_info": action_info
+            }
+            
+            # Save to regular actions output directory
+            if self.save_actions:
+                step_filename = f"step_{self.step_count_global:03d}.json"
+                step_filepath = os.path.join(self.actions_output_dir, step_filename)
+                
+                with open(step_filepath, 'w') as f:
+                    json.dump(step_data, f, indent=2)
+                
+                print(f"[STEP_SAVE] 💾 Saved step {self.step_count_global}: {action_type} -> {step_filepath}")
+            
+            # Save to epoch export directory if this is the last episode of an epoch
+            if self.export_last_epoch_episode and self.is_last_episode_of_epoch and self.epoch_step_export_dir:
+                epoch_step_filename = f"step_{self.step_count:03d}.json"  # Use episode step count for epoch export
+                epoch_step_filepath = os.path.join(self.epoch_step_export_dir, epoch_step_filename)
+                
+                with open(epoch_step_filepath, 'w') as f:
+                    json.dump(step_data, f, indent=2)
+                
+                print(f"[EPOCH_EXPORT] 📊 Saved epoch step {self.step_count}: {action_type} -> {epoch_step_filepath}")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to save step file: {e}")
+
+    def _save_episode_actions(self):
+        """Save the current episode's actions to a JSON file"""
+        if not self.current_episode_actions:
+            return
+        
+        try:
+            # Create episode summary
+            episode_data = {
+                "episode_number": self.episode_count,
+                "total_steps": len(self.current_episode_actions),
+                "total_reward": sum(self.current_episode_rewards),
+                "final_voxels": int(np.sum(self.grid)),
+                "epw_file": os.path.basename(self.current_epw) if self.current_epw else None,
+                "grid_size": [self.gx, self.gy, self.gz],
+                "root_voxel": list(self.root_voxel),
+                "final_facade_params": {k: v.tolist() for k, v in self.current_facade_params.items()},
+                "actions": []
+            }
+            
+            # Process each action
+            for step, (action_idx, reward) in enumerate(zip(self.current_episode_actions, self.current_episode_rewards)):
+                voxel_part, facade_part = self._decode_combined_action(action_idx)
+                action_type, coords_or_params = voxel_part
+                
+                action_info = {
+                    "step": step,
+                    "action_idx": action_idx,
+                    "action_type": action_type,
+                    "reward": reward,
+                    "voxels": voxel_part,
+                    "facade": facade_part
+                }
+                
+                # Add specific action details
+                if action_type in ["add", "delete"] and coords_or_params is not None:
+                    try:
+                        x, y, z = coords_or_params
+                        action_info["coordinates"] = [int(x), int(y), int(z)]  # type: ignore
+                    except (ValueError, TypeError, IndexError):
+                        pass  # Skip if coordinates can't be converted
+                elif action_type == "done":
+                    action_info["early_termination"] = True
+                
+                # Add facade information if present
+                if facade_part is not None:
+                    _, (param_name, direction_idx, value, direction_name) = facade_part
+                    action_info["facade_change"] = {
+                        "parameter": param_name,
+                        "direction": direction_name,
+                        "direction_idx": int(direction_idx),
+                        "value": int(value)
+                    }
+                
+                # Add any additional info from the step
+                if step < len(self.current_episode_infos):
+                    step_info = self.current_episode_infos[step]
+                    if "unstuck" in step_info:
+                        action_info["unstuck"] = step_info["unstuck"]
+                
+                episode_data["actions"].append(action_info)
+            
+            # Create subfolder with model name and epoch
+            import time
+            model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
+            subfolder_name = f"{self.model_name}_{model_date_time}_epoch_{self.current_epoch}"
+            episode_subfolder = os.path.join(self.actions_output_dir, subfolder_name)
+            os.makedirs(episode_subfolder, exist_ok=True)
+            
+            # Save to file in subfolder
+            filename = f"episode_{self.episode_count:04d}_port_{self.port}.json"
+            filepath = os.path.join(episode_subfolder, filename)
+            
+            with open(filepath, 'w') as f:
+                json.dump(episode_data, f, indent=2)
+            
+            print(f"[EPISODE] 💾 Saved episode {self.episode_count} actions to: {filepath}")
+            print(f"[EPISODE] 📊 {len(self.current_episode_actions)} steps, total reward: {sum(self.current_episode_rewards):.4f}")
+            
+            # Also save the final grid state in the same subfolder
+            grid_filename = f"episode_{self.episode_count:04d}_port_{self.port}_grid.json"
+            grid_filepath = os.path.join(episode_subfolder, grid_filename)
+            export_voxel_grid(self.grid, grid_filepath)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to save episode actions: {e}")
 
     def render(self):
         print(self.grid)

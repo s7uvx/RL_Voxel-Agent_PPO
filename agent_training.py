@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import torch
 import math
+import json
 import psutil  # process management for locating/killing PowerShell
 
 from sb3_contrib import MaskablePPO
@@ -195,37 +196,6 @@ def mask_fn(env):
     return env.unwrapped.action_masks()
 
 # ---------------------------
-# Vec env factory
-# ---------------------------
-def make_single_env(rank: int = 0):
-    def _thunk():
-        e = VoxelEnv(
-            port=args.port + rank,
-            grid_size=GRID_PARAM,
-            device='cpu',
-            str_wt=2.0,
-            sun_wt=0.4,
-            wst_wt=0.005,
-            cst_wt=0.05,
-            day_wt=0.4,
-            early_done=args.early_done,
-            early_done_bonus=args.early_done_bonus,
-            early_done_min_voxels=args.early_done_min_voxels
-        )  # type: ignore[arg-type]
-        e = wrappers.TimeLimit(env=e, max_episode_steps=256)
-        e = ActionMasker(e, mask_fn)
-        
-        return e
-    return _thunk
-
-num_envs = max(1, args.n_envs)
-env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
-# Log raw (unnormalized) episode rewards
-env = VecMonitor(env)
-# Normalize rewards seen by the agent (zero-mean, unit-variance)
-env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
-
-# ---------------------------
 # PPO hyperparams
 # ---------------------------
 num_steps = 128          # rollout length per env 
@@ -259,14 +229,13 @@ def _make_lr_schedule(kind: str, lr_start: float, lr_end: float):
 # Build schedule once
 lr_schedule = _make_lr_schedule(args.lr_schedule, args.lr, args.lr_final)
 norm_path = os.path.join(model_dir, "vecnormalize.pkl")
-# If resuming, load running stats
-if os.path.exists(norm_path):
-    env = VecNormalize.load(norm_path, env)
-    env.training = True
-    env.norm_reward = True
+
 # ---------------------------
-# Model loading
+# Model loading and name determination
 # ---------------------------
+model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
+model_name = f"maskable_ppo_voxel_{model_date_time}"  # Default for new models
+
 if args.checkpoint:
     existing_checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith(".zip")]
     if not existing_checkpoints:
@@ -274,21 +243,69 @@ if args.checkpoint:
     latest_ckpt = max(existing_checkpoints,
                       key=lambda f: os.path.getmtime(os.path.join(checkpoint_dir, f)))
     print(f"Resuming from checkpoint: {latest_ckpt}")
+    model_name = os.path.splitext(latest_ckpt)[0]  # Use checkpoint name
     model_path = os.path.join(checkpoint_dir, latest_ckpt)
-    model = MaskablePPO.load(model_path, env=env, device="cpu")
-    # override lr schedule when resuming
-    model.lr_schedule = lr_schedule
 elif not args.new:
     existing_models = [f for f in os.listdir(model_dir) if f.endswith(".zip")]
     if existing_models:
         latest_model = os.path.splitext(sorted(existing_models, key=lambda x: os.path.getmtime(os.path.join(model_dir, x)))[-1])[0]
         print(f"Loading existing MaskablePPO model: {latest_model}")
-        model = MaskablePPO.load(os.path.join(model_dir, latest_model), env=env, device='cpu')
-        starting_step = model._total_timesteps if hasattr(model, "_total_timesteps") else 0
-        model.lr_schedule = lr_schedule
+        model_name = latest_model  # Use existing model name
+        starting_step = 0  # Will be updated after loading
     else:
         print("No saved models found. Starting fresh.")
         args.new = True
+
+# ---------------------------
+# Vec env factory (now with proper model name)
+# ---------------------------
+def make_single_env(rank: int = 0):
+    def _thunk():
+        e = VoxelEnv(
+            port=args.port + rank,
+            grid_size=GRID_PARAM,
+            device='cpu',
+            str_wt=2.0,
+            sun_wt=0.4,
+            wst_wt=0.005,
+            cst_wt=0.05,
+            day_wt=0.4,
+            early_done=args.early_done,
+            early_done_bonus=args.early_done_bonus,
+            early_done_min_voxels=args.early_done_min_voxels,
+            save_actions=True,
+            actions_output_dir=f"episode_actions_{model_name}_env_{rank}",
+            export_last_epoch_episode=True,  # Enable epoch step export
+            model_name=model_name
+        )  # type: ignore[arg-type]
+        e = wrappers.TimeLimit(env=e, max_episode_steps=256)
+        e = ActionMasker(e, mask_fn)
+        
+        return e
+    return _thunk
+
+num_envs = max(1, args.n_envs)
+env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
+# Log raw (unnormalized) episode rewards
+env = VecMonitor(env)
+# Normalize rewards seen by the agent (zero-mean, unit-variance)
+env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+
+# If resuming, load running stats
+if os.path.exists(norm_path):
+    env = VecNormalize.load(norm_path, env)
+    env.training = True
+    env.norm_reward = True
+
+# Now actually load the models with the environment created
+if args.checkpoint:
+    model = MaskablePPO.load(model_path, env=env, device="cpu")
+    # override lr schedule when resuming
+    model.lr_schedule = lr_schedule
+elif not args.new and 'latest_model' in locals():
+    model = MaskablePPO.load(os.path.join(model_dir, f"{model_name}.zip"), env=env, device='cpu')
+    starting_step = model._total_timesteps if hasattr(model, "_total_timesteps") else 0
+    model.lr_schedule = lr_schedule
 
 if args.new:
     print("Creating a new MaskablePPO model")
@@ -318,15 +335,14 @@ if args.new:
 print(f"Starting training from {starting_step} with {num_envs} parallel env(s) "
       f"({'early-done ON' if args.early_done else 'early-done OFF'}) on CPU...")
 total_steps = args.timesteps
-model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
 
 save_path = os.path.join(model_dir,
-                         f"maskable_ppo_voxel_{model_date_time}_{starting_step+total_steps}")
+                         f"{model_name}_{starting_step+total_steps}")
 
 checkpoint_callback = CheckpointCallback(
     save_freq=args.chk_freq,
     save_path=checkpoint_dir,
-    name_prefix=f"maskable_ppo_voxel_{model_date_time}"
+    name_prefix=model_name
 )
 
 # --- ADDED: combine with Rhino restart callback ---
@@ -384,10 +400,76 @@ class LastEpisodeCallback(BaseCallback):
         
         return True
 
+class EpochTrackingCallback(BaseCallback):
+    """Callback to track epochs and mark last episode for step export"""
+    def __init__(self, vec_env, num_steps: int, num_epochs: int, model_name: str = "model", verbose: int = 0):
+        super().__init__(verbose)
+        self.vec_env = vec_env
+        self.num_steps = num_steps
+        self.num_epochs = num_epochs
+        self.model_name = model_name
+        self.current_epoch = 0
+        self.steps_in_current_rollout = 0
+        self.episodes_in_current_epoch = 0
+        
+    def _on_step(self) -> bool:
+        self.steps_in_current_rollout += 1
+        
+        # Update epoch information in all environments continuously
+        try:
+            if hasattr(self.vec_env, 'venv'):
+                dummy_vec = self.vec_env.venv.venv  # VecNormalize -> VecMonitor -> DummyVecEnv
+                if hasattr(dummy_vec, 'envs'):
+                    for env in dummy_vec.envs:
+                        if hasattr(env, 'unwrapped'):
+                            base_env = env.unwrapped
+                            if hasattr(base_env, 'set_epoch_info'):
+                                base_env.set_epoch_info(self.current_epoch, is_last_episode=False)
+        except Exception as e:
+            if self.verbose > 1:
+                print(f"[EPOCH_TRACKER] Warning: Could not update epoch info: {e}")
+        
+        # Check if we completed a rollout (num_steps per env)
+        if self.steps_in_current_rollout >= self.num_steps:
+            self.steps_in_current_rollout = 0
+            self.current_epoch += 1
+            
+            if self.verbose > 0:
+                print(f"[EPOCH_TRACKER] Starting epoch {self.current_epoch}")
+            
+            # Update epoch information after rollout completion
+            try:
+                if hasattr(self.vec_env, 'venv'):
+                    dummy_vec = self.vec_env.venv.venv  # VecNormalize -> VecMonitor -> DummyVecEnv
+                    if hasattr(dummy_vec, 'envs'):
+                        for env in dummy_vec.envs:
+                            if hasattr(env, 'unwrapped'):
+                                base_env = env.unwrapped
+                                if hasattr(base_env, 'set_epoch_info'):
+                                    # Mark for epoch step export if this is the last epoch of current update
+                                    is_last_epoch = (self.current_epoch % self.num_epochs == 0)
+                                    base_env.set_epoch_info(self.current_epoch, is_last_episode=is_last_epoch)
+                                    if self.verbose > 0 and is_last_epoch:
+                                        print(f"[EPOCH_TRACKER] Marked env for epoch {self.current_epoch} step export")
+            except Exception as e:
+                if self.verbose > 0:
+                    print(f"[EPOCH_TRACKER] Warning: Could not access base environments: {e}")
+        
+        return True
+
 # Add the callback to the combined callback list
 last_episode_callback = LastEpisodeCallback(verbose=1)
 
-combined_callback = CallbackList([checkpoint_callback, rhino_callback, last_episode_callback])
+# Add epoch tracking callback for step export
+epoch_tracking_callback = EpochTrackingCallback(
+    vec_env=env,
+    num_steps=num_steps,
+    num_epochs=num_epochs,
+    model_name=model_name,
+    verbose=1
+)
+
+combined_callback = CallbackList([checkpoint_callback, rhino_callback, last_episode_callback, epoch_tracking_callback])
 # ---------------------------
 # Train
 # ---------------------------
@@ -409,7 +491,7 @@ print("Training completed")
 # ---------------------------
 final_step = int(getattr(model, "num_timesteps", starting_step+total_steps))
 final_save_path = os.path.join(model_dir,
-                               f"maskable_ppo_voxel_{model_date_time}_{final_step}")
+                               f"{model_name}_{final_step}")
 model.save(final_save_path)
 print(f"Model saved as: {final_save_path}.zip")
 
@@ -418,68 +500,37 @@ print(f"Model saved as: {final_save_path}.zip")
 # ---------------------------
 print("Outputting actions from the last training episode...")
 
-if last_episode_callback.last_episode_actions:
-    output_folder = f"output_steps/model_{model_date_time}"
-    os.makedirs(output_folder, exist_ok=True)
+# if last_episode_callback.last_episode_actions:
+#     output_folder = f"output_steps/model_{model_date_time}"
+#     os.makedirs(output_folder, exist_ok=True)
     
-    # Get the unwrapped environment for action decoding
-    dummy_vec = env.venv.venv              # DummyVecEnv
-    action_masker_env = dummy_vec.envs[0]  # ActionMasker
-    inner_env = action_masker_env.unwrapped
+#     print(f"Exporting {len(last_episode_callback.last_episode_actions)} actions from last training episode...")
     
-    print(f"Exporting {len(last_episode_callback.last_episode_actions)} actions from last training episode...")
+#     # Create a summary of the episode
+#     episode_summary = {
+#         "total_steps": len(last_episode_callback.last_episode_actions),
+#         "total_reward": sum(last_episode_callback.last_episode_rewards),
+#         "episode_number": last_episode_callback.episode_count,
+#         "actions": []
+#     }
     
-    # Create a summary of the episode
-    episode_summary = {
-        "total_steps": len(last_episode_callback.last_episode_actions),
-        "total_reward": sum(last_episode_callback.last_episode_rewards),
-        "episode_number": last_episode_callback.episode_count,
-        "actions": []
-    }
-    
-    for step, (action_idx, reward) in enumerate(zip(last_episode_callback.last_episode_actions, last_episode_callback.last_episode_rewards)):
-        voxel_part, facade_part = inner_env._decode_combined_action(action_idx)
-        action_type, coords_or_params = voxel_part
-
-        action_info = {
-            "step": step,
-            "action_idx": action_idx,
-            "action_type": action_type,
-            "reward": reward
-        }
-
-        if action_type in ["add", "delete"]:
-            x, y, z = map(int, coords_or_params)
-            action_info["coordinates"] = [x, y, z]
-            print(f"Step {step}: {action_type.upper()} ({x},{y},{z}) | idx={action_idx} | reward={reward:.4f}")
-        elif action_type == "done":
-            action_info["early_termination"] = True
-            print(f"Step {step}: EARLY DONE | idx={action_idx} | reward={reward:.4f}")
-        elif facade_part is not None:
-            _, (param_name, direction_idx, value, direction_name) = facade_part
-            action_info["facade_change"] = {
-                "parameter": param_name,
-                "direction": direction_name,
-                "direction_idx": int(direction_idx),
-                "value": int(value)
-            }
-            print(f"Step {step}: FACADE {param_name}[{direction_name}]={value} | idx={action_idx} | reward={reward:.4f}")
-        elif action_type == "noop":
-            print(f"Step {step}: NOOP | idx={action_idx} | reward={reward:.4f}")
-        else:
-            print(f"Step {step}: UNKNOWN | idx={action_idx} | reward={reward:.4f}")
+#     for step, (action_idx, reward) in enumerate(zip(last_episode_callback.last_episode_actions, last_episode_callback.last_episode_rewards)):
+#         action_info = {
+#             "step": step,
+#             "action_idx": action_idx,
+#             "reward": reward
+#         }
         
-        episode_summary["actions"].append(action_info)
+#         print(f"Step {step}: Action {action_idx} | reward={reward:.4f}")
+#         episode_summary["actions"].append(action_info)
     
-    # Save episode summary
-    summary_file = os.path.join(output_folder, "last_episode_summary.json")
-    with open(summary_file, 'w') as f:
-        json.dump(episode_summary, f, indent=2)
+#     # Save episode summary
+#     summary_file = os.path.join(output_folder, "last_episode_summary.json")
+#     with open(summary_file, 'w') as f:
+#         json.dump(episode_summary, f, indent=2)
     
-    print(f"Last training episode summary saved to: {summary_file}")
-    print(f"Episode had {len(last_episode_callback.last_episode_actions)} steps with total reward: {sum(last_episode_callback.last_episode_rewards):.4f}")
-else:
-    print("No episode data captured during training.")
+#     print(f"Last training episode summary saved to: {summary_file}")
+#     print(f"Episode had {len(last_episode_callback.last_episode_actions)} steps with total reward: {sum(last_episode_callback.last_episode_rewards):.4f}")
+# else:
+#     print("No episode data captured during training.")
 
-print("Tensorboard logs: ./ppo_voxel_tensorboard/")
-print(f"Action space: {inner_env.action_space}")
