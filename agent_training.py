@@ -179,6 +179,8 @@ parser.add_argument('--early-done-bonus', type=float, default=0.0,
                     help='Bonus (or penalty if negative) when DONE is used meeting min occupancy')
 parser.add_argument('--early-done-min-voxels', type=float, default=0.1,
                     help='Minimum fraction (<=1) or absolute count (>1) of active voxels required for DONE bonus')
+parser.add_argument('--log-actions-every', type=int, default=100,
+                    help='Log episode actions every N episodes (default: 100, set to 0 to disable)')
 args = parser.parse_args()
 
 GRID_PARAM = parse_grid(args.grid)
@@ -273,10 +275,11 @@ def make_single_env(rank: int = 0):
             early_done=args.early_done,
             early_done_bonus=args.early_done_bonus,
             early_done_min_voxels=args.early_done_min_voxels,
-            save_actions=True,
+            save_actions=args.log_actions_every > 0,
             actions_output_dir=f"episode_actions_{model_name}_env_{rank}",
             export_last_epoch_episode=True,  # Enable epoch step export
-            model_name=model_name
+            model_name=model_name,
+            log_actions_every=args.log_actions_every
         )  # type: ignore[arg-type]
         e = wrappers.TimeLimit(env=e, max_episode_steps=256)
         e = ActionMasker(e, mask_fn)
