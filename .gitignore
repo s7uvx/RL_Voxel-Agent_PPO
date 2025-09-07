@@ -1,5 +1,10 @@
 .venv/
 .vscode/
-output_steps/
-output_steps_vec/
-ppo_voxel_tensorboard/
+output_steps/*
+output_steps_vec/*
+ppo_voxel_tensorboard/*
+episode_actions*
+models/*
+pyproject.toml
+episode_actions/*
+settings.jsonS
