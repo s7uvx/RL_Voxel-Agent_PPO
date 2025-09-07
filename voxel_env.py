@@ -17,7 +17,7 @@ class VoxelEnv(Env):
     def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=7, step_penalty=0.0,
                  num_repulsors: int = 2, sun_wt = 0.5, str_wt = 0.3, cst_wt = 0.1, wst_wt = 0.1, day_wt = 0.1,
                  repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
-                 repulsor_provider: Optional[Callable[["VoxelEnv", np.random.Generator], Iterable[Sequence[float]]]] = None,
+                 repulsor_provider: str = "edge",
                  early_done: bool = False,
                  early_done_bonus: float = 0.0,
                  early_done_min_voxels: float = 0.0,
@@ -149,7 +149,7 @@ class VoxelEnv(Env):
         # Action tracking for episode output
         self.save_actions = save_actions
         self.actions_output_dir = actions_output_dir
-        self.log_actions_every = max(1, log_actions_every)  # Ensure at least 1
+        self.log_actions_every = log_actions_every
         self.current_episode_actions = []
         self.current_episode_rewards = []
         self.current_episode_infos = []
@@ -248,7 +248,36 @@ class VoxelEnv(Env):
             facade_params=self.current_facade_params)
         
         return reward
+    
+    def _set_repulsors(self):
+        if self.repulsor_provider == "random":
+            repulse_choice = np.random.choice(["edge", "floor", "volume"])
+        else:
+            repulse_choice = self.repulsor_provider
+        match repulse_choice:
+            case "edge":
+                self.repulsors = self._edge_repulsors()
+            case "floor":
+                self.repulsors = self._floor_repulsors()
+            case "volume":
+                self.repulsors = self._volume_repulsors()
+    
+    def _edge_repulsors(self):
+        """Generate edge repulsors with one-liner list comprehension"""
+        edges = [
+            lambda: [0, np.random.randint(0, self.gy), 0],              # Left
+            lambda: [self.gx-1, np.random.randint(0, self.gy), 0],     # Right  
+            lambda: [np.random.randint(0, self.gx), 0, 0],             # Front
+            lambda: [np.random.randint(0, self.gx), self.gy-1, 0]      # Back
+        ]
 
+        return [edges[np.random.randint(0,4)]() for i in range(self.num_repulsors)]
+    
+    def _floor_repulsors(self):
+        return [(np.random.randint(0,self.gx), np.random.randint(0,self.gy),0) for i in range(self.num_repulsors)]
+
+    def _volume_repulsors(self):
+        return [(np.random.randint(0,self.gx), np.random.randint(0,self.gy), np.random.randint(0,self.gz)) for i in range(self.num_repulsors)]
     # ---------------------------
     # Action masking support
     # ---------------------------
@@ -349,35 +378,35 @@ class VoxelEnv(Env):
         self.grid[self.root_voxel] = 1
 
         # Generate per-episode repulsor points (use hook if provided; else random)
-        self.repulsors = []
-        def _random_repulsors() -> list[list[int]]:
-            pts: list[list[int]] = []
-            for _ in range(max(0, int(self.num_repulsors))):
-                rx = int(rng.integers(0, self.gx))
-                ry = int(rng.integers(0, self.gy))
-                rz = int(rng.integers(0, self.gz))
-                pts.append([rx, ry, rz])
-            return pts
+        # self.repulsors = []
+        # def _random_repulsors() -> list[list[int]]:
+        #     pts: list[list[int]] = []
+        #     for _ in range(max(0, int(self.num_repulsors))):
+        #         rx = int(rng.integers(0, self.gx))
+        #         ry = int(rng.integers(0, self.gy))
+        #         rz = int(rng.integers(0, self.gz))
+        #         pts.append([rx, ry, rz])
+        #     return pts
 
-        if self.repulsor_provider is not None:
-            try:
-                provided = list(self.repulsor_provider(self, rng))  # expect iterable of 3D points
-                arr = np.asarray(provided, dtype=float)
-                if arr.ndim == 1:
-                    arr = arr.reshape(1, -1)
-                if arr.size == 0 or arr.shape[1] < 3:
-                    raise ValueError("Repulsor provider must yield points with at least 3 coordinates")
-                coords = np.rint(arr[:, :3]).astype(int)
-                coords[:, 0] = np.clip(coords[:, 0], 0, self.gx - 1)
-                coords[:, 1] = np.clip(coords[:, 1], 0, self.gy - 1)
-                coords[:, 2] = np.clip(coords[:, 2], 0, self.gz - 1)
-                self.repulsors = coords.tolist()[: max(0, int(self.num_repulsors))]
-            except Exception:
-                # Fallback to random on any provider error
-                self.repulsors = _random_repulsors()
-        else:
-            self.repulsors = _random_repulsors()
-
+        # if self.repulsor_provider is not None:
+        #     try:
+        #         provided = list(self.repulsor_provider(self, rng))  # expect iterable of 3D points
+        #         arr = np.asarray(provided, dtype=float)
+        #         if arr.ndim == 1:
+        #             arr = arr.reshape(1, -1)
+        #         if arr.size == 0 or arr.shape[1] < 3:
+        #             raise ValueError("Repulsor provider must yield points with at least 3 coordinates")
+        #         coords = np.rint(arr[:, :3]).astype(int)
+        #         coords[:, 0] = np.clip(coords[:, 0], 0, self.gx - 1)
+        #         coords[:, 1] = np.clip(coords[:, 1], 0, self.gy - 1)
+        #         coords[:, 2] = np.clip(coords[:, 2], 0, self.gz - 1)
+        #         self.repulsors = coords.tolist()[: max(0, int(self.num_repulsors))]
+        #     except Exception:
+        #         # Fallback to random on any provider error
+        #         self.repulsors = _random_repulsors()
+        # else:
+        #     self.repulsors = _random_repulsors()
+        self._set_repulsors()
         # Pick EPW for this episode
         self.current_epw = np.random.choice(self.epw_files)
         normalized_epw = self.current_epw.replace("\\", "/")
@@ -730,6 +759,17 @@ class VoxelEnv(Env):
         if not self.save_actions and not (self.export_last_epoch_episode and self.is_last_episode_of_epoch):
             return
         
+        # Check if we should save this episode based on frequency (same as _save_episode_actions)
+        if self.save_actions and self.log_actions_every > 0 and (self.episode_count % self.log_actions_every != 0):
+            # Skip saving step files for episodes that won't be logged
+            pass  # Don't return here, we still want epoch export to work
+        elif not self.save_actions:
+            # Only proceed if epoch export is enabled
+            pass
+        else:
+            # We should save this episode's steps
+            pass
+        
         def _to_serializable(obj):
             """Convert numpy types and other non-serializable objects to Python native types"""
             if isinstance(obj, np.integer):
@@ -792,18 +832,31 @@ class VoxelEnv(Env):
                     "cols": self.current_facade_params["cols"].tolist(),
                     "rows": self.current_facade_params["rows"].tolist()
                 },
+                "repulsors": _to_serializable(self.repulsors) if hasattr(self, 'repulsors') and self.repulsors else [],
                 "action_info": _to_serializable(action_info)
             }
             
-            # Save to regular actions output directory
-            if self.save_actions:
-                step_filename = f"step_{self.step_count_global:03d}.json"
-                step_filepath = os.path.join(self.actions_output_dir, step_filename)
+            # Save to regular actions output directory with episode-specific folder
+            # Only save if this episode should be logged
+            if self.save_actions and (self.episode_count % self.log_actions_every == 0):
+                # Create main subfolder with model name and epoch
+                import time
+                model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
+                subfolder_name = f"{model_date_time}_epoch_{self.current_epoch}"
+                episode_main_folder = os.path.join(self.actions_output_dir, subfolder_name)
+                os.makedirs(episode_main_folder, exist_ok=True)
+                
+                # Create episode-specific subfolder
+                episode_step_dir = os.path.join(episode_main_folder, f"episode_{self.episode_count:04d}")
+                os.makedirs(episode_step_dir, exist_ok=True)
+                
+                step_filename = f"step_{self.step_count:03d}.json"  # Use episode step count
+                step_filepath = os.path.join(episode_step_dir, step_filename)
                 
                 with open(step_filepath, 'w') as f:
                     json.dump(_to_serializable(step_data), f, indent=2)
                 
-                print(f"[STEP_SAVE] 💾 Saved step {self.step_count_global}: {action_type} -> {step_filepath}")
+                print(f"[STEP_SAVE] 💾 Saved episode {self.episode_count} step {self.step_count}: {action_type} -> {step_filepath}")
             
             # Save to epoch export directory if this is the last episode of an epoch
             if self.export_last_epoch_episode and self.is_last_episode_of_epoch and self.epoch_step_export_dir:
@@ -901,15 +954,19 @@ class VoxelEnv(Env):
                 
                 episode_data["actions"].append(action_info)
             
-            # Create subfolder with model name and epoch
+            # Create subfolder with model name and epoch, and episode-specific subfolder
             import time
             model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
             subfolder_name = f"{self.model_name}_{model_date_time}_epoch_{self.current_epoch}"
-            episode_subfolder = os.path.join(self.actions_output_dir, subfolder_name)
+            episode_main_folder = os.path.join(self.actions_output_dir, subfolder_name)
+            os.makedirs(episode_main_folder, exist_ok=True)
+            
+            # Create episode-specific subfolder within the main folder
+            episode_subfolder = os.path.join(episode_main_folder, f"episode_{self.episode_count:04d}")
             os.makedirs(episode_subfolder, exist_ok=True)
             
-            # Save to file in subfolder
-            filename = f"episode_{self.episode_count:04d}_port_{self.port}.json"
+            # Save episode summary to episode subfolder
+            filename = f"episode_summary_port_{self.port}.json"
             filepath = os.path.join(episode_subfolder, filename)
             
             with open(filepath, 'w') as f:
@@ -918,8 +975,8 @@ class VoxelEnv(Env):
             print(f"[EPISODE] 💾 Saved episode {self.episode_count} actions to: {filepath}")
             print(f"[EPISODE] 📊 {len(self.current_episode_actions)} steps, total reward: {sum(self.current_episode_rewards):.4f}")
             
-            # Also save the final grid state in the same subfolder
-            grid_filename = f"episode_{self.episode_count:04d}_port_{self.port}_grid.json"
+            # Also save the final grid state in the same episode subfolder
+            grid_filename = f"final_grid_port_{self.port}.json"
             grid_filepath = os.path.join(episode_subfolder, grid_filename)
             export_voxel_grid(self.grid, grid_filepath)
             

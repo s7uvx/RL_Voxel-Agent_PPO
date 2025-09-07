@@ -135,15 +135,17 @@ class RhinoRestartCallback(BaseCallback):
         self._cycle = 0
 
     def _init_callback(self):
+        print(f"[RhinoCompute] Initializing with restart interval: {self.restart_interval} timesteps")
+        print(f"[RhinoCompute] Next restart scheduled at: {self._next_restart} timesteps")
         self._proc = _start_rhino_new_window(self.script_path)
 
     def _on_step(self) -> bool:
         # Only check for restart at the end of complete rollouts
         # num_timesteps tracks total timesteps across all environments
-        if self.num_timesteps >= self._next_restart and self.num_timesteps % self.restart_interval == 0:
+        if self.num_timesteps >= self._next_restart:
             self._cycle += 1
             if self.verbose:
-                print(f"[RhinoCompute] Restart #{self._cycle} at timesteps={self.num_timesteps}")
+                print(f"[RhinoCompute] Restart #{self._cycle} at timesteps={self.num_timesteps} (interval={self.restart_interval})")
             _stop_rhino(self._proc)
             time.sleep(5.0)  # Give time for process to fully terminate
             self._proc = _start_rhino_new_window(self.script_path)
@@ -206,7 +208,9 @@ batch_size = 32          # must divide (num_steps * num_envs); 1024*k is always 
 
 RHINO_PS1 = os.path.join(os.getcwd(), "start_rhino_compute.ps1")
 # Make restart interval a multiple of episode length (256 steps)
-RHINO_RESTART_INTERVAL = 1000//num_steps * num_steps  # 1024 timesteps = 4 episodes
+# With num_steps=128, this gives us: 1000//128 * 128 = 7 * 128 = 896 timesteps
+RHINO_RESTART_INTERVAL = (1000 // num_steps) * num_steps
+print(f"[RhinoCompute] Restart interval set to {RHINO_RESTART_INTERVAL} timesteps ({RHINO_RESTART_INTERVAL // 256} episodes)")
 
 starting_step = 0
 model_dir = os.path.join(os.getcwd(), 'models', 'PPO')
@@ -258,6 +262,7 @@ elif not args.new:
         print("No saved models found. Starting fresh.")
         args.new = True
 
+
 # ---------------------------
 # Vec env factory (now with proper model name)
 # ---------------------------
@@ -272,11 +277,16 @@ def make_single_env(rank: int = 0):
             wst_wt=0.005,
             cst_wt=0.05,
             day_wt=0.4,
+            # Repulsor configuration
+            num_repulsors=3,  # Number of repulsors
+            repulsor_wt=0.5,  # Weight in reward calculation (increase for stronger effect)
+            repulsor_radius=5.0,  # Radius of repulsion effect
+            repulsor_provider="random",  # Use custom provider (or None for random)
             early_done=args.early_done,
             early_done_bonus=args.early_done_bonus,
             early_done_min_voxels=args.early_done_min_voxels,
             save_actions=args.log_actions_every > 0,
-            actions_output_dir=f"episode_actions_{model_name}_env_{rank}",
+            actions_output_dir=f"episode_actions/{model_name}",
             export_last_epoch_episode=True,  # Enable epoch step export
             model_name=model_name,
             log_actions_every=args.log_actions_every
@@ -502,38 +512,4 @@ print(f"Model saved as: {final_save_path}.zip")
 # Output actions from last training episode
 # ---------------------------
 print("Outputting actions from the last training episode...")
-
-# if last_episode_callback.last_episode_actions:
-#     output_folder = f"output_steps/model_{model_date_time}"
-#     os.makedirs(output_folder, exist_ok=True)
-    
-#     print(f"Exporting {len(last_episode_callback.last_episode_actions)} actions from last training episode...")
-    
-#     # Create a summary of the episode
-#     episode_summary = {
-#         "total_steps": len(last_episode_callback.last_episode_actions),
-#         "total_reward": sum(last_episode_callback.last_episode_rewards),
-#         "episode_number": last_episode_callback.episode_count,
-#         "actions": []
-#     }
-    
-#     for step, (action_idx, reward) in enumerate(zip(last_episode_callback.last_episode_actions, last_episode_callback.last_episode_rewards)):
-#         action_info = {
-#             "step": step,
-#             "action_idx": action_idx,
-#             "reward": reward
-#         }
-        
-#         print(f"Step {step}: Action {action_idx} | reward={reward:.4f}")
-#         episode_summary["actions"].append(action_info)
-    
-#     # Save episode summary
-#     summary_file = os.path.join(output_folder, "last_episode_summary.json")
-#     with open(summary_file, 'w') as f:
-#         json.dump(episode_summary, f, indent=2)
-    
-#     print(f"Last training episode summary saved to: {summary_file}")
-#     print(f"Episode had {len(last_episode_callback.last_episode_actions)} steps with total reward: {sum(last_episode_callback.last_episode_rewards):.4f}")
-# else:
-#     print("No episode data captured during training.")
 
