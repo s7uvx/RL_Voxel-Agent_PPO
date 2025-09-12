@@ -2,9 +2,9 @@ import os
 import time
 import argparse
 import numpy as np
-import torch
+# import torch
 import math
-import json
+# import json
 import psutil  # process management for locating/killing PowerShell
 
 from sb3_contrib import MaskablePPO
@@ -12,11 +12,16 @@ from sb3_contrib.common.wrappers import ActionMasker
 # from sb3_contrib.common.maskable.evaluation import evaluate_policy  # optional
 
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
+from stable_baselines3.common.vec_env import VecEnvWrapper
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
 from gymnasium import wrappers
+from gymnasium import spaces as gym_spaces
 
 from voxel_env import VoxelEnv, export_voxel_grid
+
+from torch.distributions import Distribution
+Distribution.set_default_validate_args(False)
 
 # ---------------------------
 # Utility functions
@@ -266,49 +271,98 @@ elif not args.new:
 # ---------------------------
 # Vec env factory (now with proper model name)
 # ---------------------------
+# REMOVE old RewardNormalizeWrapper and add VecEnv wrapper
+class RewardNormVecEnv(VecEnvWrapper):
+    """
+    Reward normalization for Dict (or any) observations when VecNormalize (obs) is not usable.
+    Normalizes rewards using running variance of discounted returns (shared across envs).
+    """
+    def __init__(self, venv, gamma: float = 0.99, eps: float = 1e-8, clip: float = 10.0):
+        super().__init__(venv)
+        self.gamma = gamma
+        self.eps = eps
+        self.clip = clip
+        self.returns = np.zeros(self.num_envs, dtype=np.float32)
+        self.count = 1e-4
+        self.running_mean = 0.0
+        self.running_var = 1.0  # actually sum of squared diffs (Welford accumulator)
+
+    def reset(self):
+        self.returns[:] = 0.0
+        return self.venv.reset()
+
+    def step_async(self, actions):
+        return self.venv.step_async(actions)
+
+    def step_wait(self):
+        obs, rewards, dones, infos = self.venv.step_wait()
+        # Update discounted returns per env
+        self.returns = self.returns * self.gamma + rewards
+        # Welford update over each return (treat each env return as a sample)
+        for R in self.returns:
+            self.count += 1.0
+            delta = R - self.running_mean
+            self.running_mean += delta / self.count
+            delta2 = R - self.running_mean
+            self.running_var += delta * delta2
+        std = max(self.eps, np.sqrt(self.running_var / self.count))
+        norm_rewards = np.clip(rewards / std, -self.clip, self.clip)
+
+        # Reset return accumulator when an episode ends
+        for i, d in enumerate(dones):
+            if d:
+                self.returns[i] = 0.0
+        return obs, norm_rewards, dones, infos
+
 def make_single_env(rank: int = 0):
     def _thunk():
         e = VoxelEnv(
             port=args.port + rank,
             grid_size=GRID_PARAM,
             device='cpu',
+            step_penalty=0.01,
             str_wt=2.0,
-            sun_wt=0.4,
-            wst_wt=0.005,
-            cst_wt=0.05,
-            day_wt=0.4,
-            # Repulsor configuration
-            num_repulsors=3,  # Number of repulsors
-            repulsor_wt=0.5,  # Weight in reward calculation (increase for stronger effect)
-            repulsor_radius=5.0,  # Radius of repulsion effect
-            repulsor_provider="random",  # Use custom provider (or None for random)
+            sun_wt=0.5,
+            wst_wt=0.1,
+            cst_wt=0.1,
+            day_wt=0.5,
+            num_repulsors=2,
+            repulsor_wt=0.1,
+            repulsor_radius=3.0,
+            repulsor_provider="random",
             early_done=args.early_done,
             early_done_bonus=args.early_done_bonus,
             early_done_min_voxels=args.early_done_min_voxels,
             save_actions=args.log_actions_every > 0,
             actions_output_dir=f"episode_actions/{model_name}",
-            export_last_epoch_episode=True,  # Enable epoch step export
+            export_last_epoch_episode=True,
             model_name=model_name,
             log_actions_every=args.log_actions_every
-        )  # type: ignore[arg-type]
+        )
         e = wrappers.TimeLimit(env=e, max_episode_steps=256)
         e = ActionMasker(e, mask_fn)
-        
         return e
     return _thunk
 
 num_envs = max(1, args.n_envs)
 env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
-# Log raw (unnormalized) episode rewards
 env = VecMonitor(env)
-# Normalize rewards seen by the agent (zero-mean, unit-variance)
-env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
-# If resuming, load running stats
-if os.path.exists(norm_path):
-    env = VecNormalize.load(norm_path, env)
-    env.training = True
-    env.norm_reward = True
+# Decide normalization strategy
+use_vecnormalize = isinstance(env.observation_space, gym_spaces.Box)
+if use_vecnormalize:
+    env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+    if os.path.exists(norm_path):
+        try:
+            env = VecNormalize.load(norm_path, env)
+            env.training = True
+            env.norm_reward = True
+            print("Loaded VecNormalize stats.")
+        except AssertionError:
+            print("VecNormalize stats incompatible with new obs shape. Starting fresh stats.")
+else:
+    print("Dict observation space detected -> applying RewardNormVecEnv (reward-only normalization).")
+    env = RewardNormVecEnv(env)
 
 # Now actually load the models with the environment created
 if args.checkpoint:
@@ -320,13 +374,15 @@ elif not args.new and 'latest_model' in locals():
     starting_step = model._total_timesteps if hasattr(model, "_total_timesteps") else 0
     model.lr_schedule = lr_schedule
 
+# When creating a new model (policy always MultiInputPolicy for Dict)
 if args.new:
     print("Creating a new MaskablePPO model")
+    policy_type = "MultiInputPolicy"
     model = MaskablePPO(
-        "MlpPolicy",
+        policy_type,
         env,
         verbose=1,
-        learning_rate=lr_schedule,   # <-- schedule here
+        learning_rate=lr_schedule,
         gamma=0.99,
         n_steps=num_steps,
         batch_size=batch_size,
@@ -338,7 +394,7 @@ if args.new:
         clip_range=0.2,
         policy_kwargs=dict(ortho_init=False),
         device="cpu",
-        tensorboard_log="./ppo_voxel_tensorboard/"
+        tensorboard_log=f"./ppo_voxel_tensorboard/{model_name}/"
     )
     starting_step = 0
 
@@ -490,13 +546,15 @@ model.learn(
     total_timesteps=total_steps,
     progress_bar=True,
     callback=combined_callback,  # CHANGED: was checkpoint_callback
-    reset_num_timesteps=False,
-    tb_log_name=f"MaskablePPO_lr-{args.lr_schedule}"
+    reset_num_timesteps=False
 )
 
-# Save VecNormalize stats so evaluation uses the same scaling
-env.save(norm_path)
-print(f"Saved VecNormalize stats: {norm_path}")
+# Saving normalization stats (only for VecNormalize)
+if use_vecnormalize:
+    env.save(norm_path)
+    print(f"Saved VecNormalize stats: {norm_path}")
+else:
+    print("VecNormalize not used (Dict obs); skipping stats save.")
 print("Training completed")
 
 # ---------------------------

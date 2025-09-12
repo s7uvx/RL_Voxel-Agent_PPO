@@ -50,6 +50,9 @@ class VoxelEnv(Env):
         ry = np.random.randint(0, self.gy)
         self.root_voxel = (rx, ry, 0)
         self.grid[rx, ry, 0] = 1
+        # Backbone (central tower) container
+        self.central_tower_set: set[tuple[int,int,int]] = set()
+        self._build_central_tower()  # ensure full-height tower at start
 
         # Action space with NO-OP and facade actions
         total_locations = int(self.gx * self.gy * self.gz)
@@ -79,15 +82,6 @@ class VoxelEnv(Env):
 
         self.episode_return = 0.0  # <-- INIT cumulative episode reward
 
-        # Facade parameters: 2 parameters × 4 directions × 7 values = 56 actions
-        self.FACADE_ACTIONS = 2 * 4 * 7  # 56 facade actions
-
-        # Combined action space: (voxel ops) × (facade ops + NO-FACADE)
-        self.voxel_actions_count = self.NOOP_IDX + 1  # 2N + 1
-        self.facade_actions_count = self.FACADE_ACTIONS + 1  # 56 + 1 (last is NO-FACADE)
-        self.NO_FACADE_IDX = self.FACADE_ACTIONS  # sentinel index for no facade change
-        self.action_space = spaces.Discrete(self.voxel_actions_count * self.facade_actions_count)
-        
         # Facade parameter ranges and current values
         self.facade_min_val = 1
         self.facade_max_val = 7
@@ -96,11 +90,11 @@ class VoxelEnv(Env):
             'rows': np.array([4,4,4,4], dtype=np.int32),
         }
 
-        self.observation_space = spaces.Box(
-            low=0, high=1,
-            shape=(total_locations,),
-            dtype=np.float32
-        )
+        # REPLACED: single Box -> Dict with voxel + repulsor grids
+        self.observation_space = spaces.Dict({
+            'vox': spaces.Box(low=0, high=1, shape=(self.gx, self.gy, self.gz), dtype=np.float32),
+            'rep': spaces.Box(low=0, high=1, shape=(self.gx, self.gy, self.gz), dtype=np.float32)
+        })
 
         # Episode/time-limit + anti-churn
         self.max_steps = max_steps
@@ -133,6 +127,7 @@ class VoxelEnv(Env):
         self.repulsor_wt = repulsor_wt
         self.repulsor_radius = repulsor_radius
         self.repulsor_provider = repulsor_provider
+        self._set_repulsors()
 
         self.epw_folder = os.path.join(os.getcwd(), 'gh_files', 'epw')
         self.epw_files = [
@@ -144,7 +139,13 @@ class VoxelEnv(Env):
             raise FileNotFoundError(f"No EPW files found in {self.epw_folder}")
 
         self.current_epw = None
-        self.repulsors = []
+        self.noop_count = 0
+        # self.repulsors = []
+        # (Was redefining observation_space with 'rpl' key; unify to 'rep')
+        self.observation_space = spaces.Dict({
+            'vox': spaces.Box(0, 1, (self.gx, self.gy, self.gz), dtype=np.float32),
+            'rep': spaces.Box(0, 1, (self.gx, self.gy, self.gz), dtype=np.float32)
+        })
 
         # Action tracking for episode output
         self.save_actions = save_actions
@@ -162,13 +163,26 @@ class VoxelEnv(Env):
         self.current_epoch = 0
         self.is_last_episode_of_epoch = False
         self.epoch_step_export_dir = None
-        
+        # Stable run timestamp (so each episode of a run goes into same dated folder)
+        # self.run_timestamp = time.strftime("%Y%m%d-%H%M", time.localtime())
+
         if self.save_actions:
             os.makedirs(self.actions_output_dir, exist_ok=True)
 
     # ---------------------------
     # Utilities
     # ---------------------------
+    def _build_central_tower(self):
+        """
+        Ensure a solid vertical tower of voxels from z=0..gz-1 at (root_x, root_y, z).
+        Rebuilds (overwrites) any previous tower definition.
+        """
+        self.central_tower_set.clear()
+        rx, ry, _ = self.root_voxel
+        for z in range(self.gz):
+            self.grid[rx, ry, z] = 1
+            self.central_tower_set.add((rx, ry, z))
+            
     def _idx_to_coords(self, location_idx):
         area = self.gx * self.gy
         z = location_idx // area
@@ -179,6 +193,21 @@ class VoxelEnv(Env):
 
     def _coords_to_idx(self, x, y, z):
         return int(x + y * self.gx + z * (self.gx * self.gy))
+
+    def _repulsor_grid(self):
+        """
+        Return a (gx, gy, gz) float32 grid with 1.0 at repulsor positions, else 0.0.
+        """
+        grid = np.zeros((self.gx, self.gy, self.gz), dtype=np.float32)
+        if hasattr(self, 'repulsors') and self.repulsors:
+            for p in self.repulsors:
+                try:
+                    px, py, pz = int(p[0]), int(p[1]), int(p[2])
+                except Exception:
+                    continue
+                if 0 <= px < self.gx and 0 <= py < self.gy and 0 <= pz < self.gz:
+                    grid[px, py, pz] = 1.0
+        return grid
 
     def _decode_facade_action(self, facade_action_idx: int):
         """
@@ -296,15 +325,31 @@ class VoxelEnv(Env):
         Boolean mask for the combined action space (voxel × facade).
         Allowed iff both sub-actions are allowed. Guarantees at least one action.
         """
-        base = (self.voxel_action_masks()[:, None] & self.facade_action_masks()[None, :]).reshape(-1)
-        if not np.any(base):
-            pure_noop_idx = self.NOOP_IDX * self.facade_actions_count + self.NO_FACADE_IDX
-            base[:] = False
-            base[pure_noop_idx] = True
+        voxel_mask = self.voxel_action_masks()
+        facade_mask = self.facade_action_masks()
+        
+        # Create the base mask for combined actions
+        base_mask = (voxel_mask[:, None] & facade_mask[None, :]).reshape(-1)
+
+        # If early_done is enabled, we need to handle the extra action index
         if self.early_done:
-            # Append DONE action (always allowed)
-            base = np.concatenate([base, np.array([True], dtype=np.bool_)])
-        return base
+            # The base mask corresponds to the first N actions, so we append a placeholder for the DONE action
+            full_mask = np.zeros(self.action_space.n, dtype=bool)
+            full_mask[:self._combo_action_count] = base_mask
+            # The DONE action is always available if enabled
+            full_mask[self.DONE_IDX] = True
+        else:
+            full_mask = base_mask
+
+        # Safeguard: If no actions are available at all, force the full NOOP action to be valid.
+        # This prevents the agent from getting stuck and causing the value error.
+        if not np.any(full_mask):
+            noop_action_idx = self.NOOP_IDX * self.facade_actions_count + self.NO_FACADE_IDX
+            if 0 <= noop_action_idx < len(full_mask):
+                full_mask[noop_action_idx] = True
+                print("[WARN] No valid actions found, forcing full NOOP to be available.")
+            
+        return full_mask
 
     def voxel_action_masks(self) -> np.ndarray:
         """
@@ -326,6 +371,10 @@ class VoxelEnv(Env):
         # DELETE actions in [total_locations, 2*total_locations)
         for loc in range(self.total_locations):
             x, y, z = self._idx_to_coords(loc)
+            # Prevent deleting any backbone voxel
+            if (x, y, z) in getattr(self, "central_tower_set", ()):
+                mask[self.total_locations + loc] = False
+                continue
             valid_del = (
                 self.grid[x, y, z] == 1
                 and (x, y, z) != self.root_voxel
@@ -364,6 +413,7 @@ class VoxelEnv(Env):
         self.step_count = 0
         self._added_cooldown.clear()
         self._deleted_cooldown.clear()
+        self.noop_count = 0
 
         # Reset facade parameters to defaults
         self.current_facade_params = {
@@ -376,6 +426,8 @@ class VoxelEnv(Env):
         ry = rng.integers(0, self.gy)
         self.root_voxel = (int(rx), int(ry), 0)
         self.grid[self.root_voxel] = 1
+        # Rebuild central tower for new episode
+        self._build_central_tower()
 
         # Generate per-episode repulsor points (use hook if provided; else random)
         # self.repulsors = []
@@ -412,7 +464,11 @@ class VoxelEnv(Env):
         normalized_epw = self.current_epw.replace("\\", "/")
         print(f"[EPISODE] ☀️ Using EPW file: {os.path.basename(normalized_epw)}", flush=True)
 
-        observation = self.grid.flatten().astype(np.float32)
+        # Build dict observation
+        observation = {
+            'vox': self.grid.astype(np.float32),
+            'rep': self._repulsor_grid()
+        }
         info = {
             "epw_file": os.path.basename(self.current_epw or ""),
             "action_masks": self.action_masks(),
@@ -502,6 +558,7 @@ class VoxelEnv(Env):
             reward = float(bonus)
             self.episode_return += reward
             observation = self.grid.flatten().astype(np.float32)
+            #TODO: add repulsor positions to observation
             info = {
                 "early_done": True,
                 "episode_return": self.episode_return,
@@ -540,9 +597,15 @@ class VoxelEnv(Env):
 
         # Apply voxel op
         if voxel_type == "noop":
+            self.noop_count += 1
+            # Penalize early NOOP
+            if self.step_count < 20:
+                reward -= 0.05
+            # Penalize NOOP
+            reward -= float(self.step_penalty)*float(self.noop_count)
             # If no facade change happened either, apply small penalty
             if facade_part is None:
-                reward += -0.01
+                reward += -0.05
             msg = "NOOP"
         elif voxel_type == "add":
             x, y, z = voxel_payload
@@ -558,12 +621,9 @@ class VoxelEnv(Env):
             reward += -0.5
             msg = "INVALID"
 
-        # Optional per-step penalty to discourage churn
-        reward = float(reward) - float(self.step_penalty)
-
         # Logging
         if step_msgs:
-            print(f"[STEP] 🏢 {' | '.join(step_msgs)}")
+            print(f"[STEP] {' | '.join(step_msgs)}")
         print(f"[STEP] ▶ {msg} -> reward: {reward:.3f}")
 
         # Episode termination logic
@@ -572,32 +632,41 @@ class VoxelEnv(Env):
         terminated = bool(active_voxels >= 0.6 * total_voxels)
 
         # Terminate or unstick if no add/delete actions remain (ignoring NOOP)
-        voxel_mask = self.voxel_action_masks()
-        no_voxel_actions = not np.any(voxel_mask[:self.NOOP_IDX])  # excludes NOOP at index NOOP_IDX
-
-        unstuck = False
-        if no_voxel_actions and self.unstick_on_exhausted and not terminated:
-            # Try to restore actions: clear cooldowns and loop memory
-            self._reset_action_restrictions(clear_cooldowns=True, clear_toggles=True)
-            voxel_mask2 = self.voxel_action_masks()
-            if np.any(voxel_mask2[:self.NOOP_IDX]):
-                # Recovered actions: apply small penalty, keep episode alive
-                reward -= self.unstick_penalty
-                unstuck = True
-                print("[UNSTICK] Cleared cooldowns/loop memory to restore valid actions.")
-            else:
-                terminated = True  # still no actions possible
+        full_mask = self.action_masks()
+        # Check if any actions other than NOOP or DONE are available
+        noop_action_idx = self.NOOP_IDX * self.facade_actions_count + self.NO_FACADE_IDX
+        other_actions_available = False
+        for i, is_available in enumerate(full_mask):
+            if is_available:
+                is_noop = (i == noop_action_idx)
+                is_done = self.early_done and (i == self.DONE_IDX)
+                if not is_noop and not is_done:
+                    other_actions_available = True
+                    break
+        
+        unstuck = False  # kept for backward compatibility in logs
+        exhausted_actions = False
+        if not other_actions_available and not terminated:
+            # No valid actions (besides NOOP/DONE). Reset internal restrictions and terminate.
+            self.reset_action_mask(clear_cooldowns=True, clear_toggles=True)
+            terminated = True
+            exhausted_actions = True
+            print("[TERMINATE] No valid actions remaining -> terminating episode and resetting action mask.")
 
         # Time-limit truncation
         truncated = self.step_count >= self.max_steps
-
-        observation = self.grid.flatten().astype(np.float32)
+        
+        observation = {
+            'vox': self.grid.astype(np.float32),
+            'rep': self._repulsor_grid()
+        }
         self.episode_return += reward
         info = {
             "epw_file": os.path.basename(self.current_epw or ""),
             "action_masks": self.action_masks(),
             "facade_params": self.current_facade_params.copy(),
             "unstuck": unstuck,
+            "exhausted_actions": exhausted_actions,
             "episode_return": self.episode_return
         }
         
@@ -662,6 +731,10 @@ class VoxelEnv(Env):
 
     def _delete_voxel(self, x, y, z):
         """Delete a voxel at specific coordinates with connectivity validation"""
+        # Block deletion if voxel is part of the enforced central tower
+        if (x, y, z) in getattr(self, "central_tower_set", ()):
+            return -0.4  # Protected backbone voxel
+
         if not (0 <= x < self.gx and 0 <= y < self.gy and 0 <= z < self.gz):
             return -0.5  # Invalid coordinates
         if self.grid[x, y, z] == 0:
@@ -839,15 +912,9 @@ class VoxelEnv(Env):
             # Save to regular actions output directory with episode-specific folder
             # Only save if this episode should be logged
             if self.save_actions and (self.episode_count % self.log_actions_every == 0):
-                # Create main subfolder with model name and epoch
-                import time
-                model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
-                subfolder_name = f"{model_date_time}_epoch_{self.current_epoch}"
-                episode_main_folder = os.path.join(self.actions_output_dir, subfolder_name)
-                os.makedirs(episode_main_folder, exist_ok=True)
-                
+                             
                 # Create episode-specific subfolder
-                episode_step_dir = os.path.join(episode_main_folder, f"episode_{self.episode_count:04d}")
+                episode_step_dir = os.path.join(self.actions_output_dir, f"episode_{self.episode_count:04d}")
                 os.makedirs(episode_step_dir, exist_ok=True)
                 
                 step_filename = f"step_{self.step_count:03d}.json"  # Use episode step count
@@ -876,8 +943,11 @@ class VoxelEnv(Env):
         if not self.current_episode_actions:
             return
         
-        # Check if we should save this episode based on frequency
-        if self.log_actions_every == 0 or (self.episode_count % self.log_actions_every != 0):
+        # Frequency gating semantics:
+        # 0 => disabled, 1 => every episode, N>1 => every N episodes
+        if self.log_actions_every == 0:
+            return
+        if self.log_actions_every > 1 and (self.episode_count % self.log_actions_every != 0):
             if self.log_actions_every > 0:
                 print(f"[EPISODE] 📝 Episode {self.episode_count} - skipping action log (saving every {self.log_actions_every} episodes)")
             return
@@ -955,14 +1025,10 @@ class VoxelEnv(Env):
                 episode_data["actions"].append(action_info)
             
             # Create subfolder with model name and epoch, and episode-specific subfolder
-            import time
-            model_date_time = time.strftime("%Y%m%d-%H%M", time.localtime())
-            subfolder_name = f"{self.model_name}_{model_date_time}_epoch_{self.current_epoch}"
-            episode_main_folder = os.path.join(self.actions_output_dir, subfolder_name)
-            os.makedirs(episode_main_folder, exist_ok=True)
+            os.makedirs(self.actions_output_dir, exist_ok=True)
             
             # Create episode-specific subfolder within the main folder
-            episode_subfolder = os.path.join(episode_main_folder, f"episode_{self.episode_count:04d}")
+            episode_subfolder = os.path.join(self.actions_output_dir, f"episode_{self.episode_count:04d}")
             os.makedirs(episode_subfolder, exist_ok=True)
             
             # Save episode summary to episode subfolder
@@ -972,8 +1038,8 @@ class VoxelEnv(Env):
             with open(filepath, 'w') as f:
                 json.dump(_to_serializable(episode_data), f, indent=2)
             
-            print(f"[EPISODE] 💾 Saved episode {self.episode_count} actions to: {filepath}")
-            print(f"[EPISODE] 📊 {len(self.current_episode_actions)} steps, total reward: {sum(self.current_episode_rewards):.4f}")
+            print(f"[EPISODE]  Saved episode {self.episode_count} actions to: {filepath}")
+            print(f"[EPISODE]  {len(self.current_episode_actions)} steps, total reward: {sum(self.current_episode_rewards):.4f}")
             
             # Also save the final grid state in the same episode subfolder
             grid_filename = f"final_grid_port_{self.port}.json"
