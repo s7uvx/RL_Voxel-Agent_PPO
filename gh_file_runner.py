@@ -27,9 +27,22 @@ def get_reward_gh(
     repulsor_wt: float = 0.0,
     repulsor_radius: float = 2.0,
     facade_params: dict | None = None,
-) -> float:
+) -> tuple[float, dict[str, float]]:
     if grid is None:
-        return -0.2
+        return -0.2, {
+            'total_reward': -0.2,
+            'cyclops_reward': 0.0,
+            'karamba_reward': 0.0,
+            'panel_cost_reward': 0.0,
+            'panel_waste_reward': 0.0,
+            'daylight_autonomy_reward': 0.0,
+            'repulsor_penalty': 0.0,
+            'weighted_cyclops': 0.0,
+            'weighted_karamba': 0.0,
+            'weighted_panel_cost': 0.0,
+            'weighted_panel_waste': 0.0,
+            'weighted_daylight_autonomy': 0.0
+        }
 
     # ✅ Convert EPW path to forward slashes
     epw_file = epw_file.replace("\\", "/")
@@ -122,7 +135,6 @@ def get_reward_gh(
                 repulsor_penalty = repulsor_wt * proximity
                 reward -= repulsor_penalty
     except Exception as e:
-        # Be robust: never break training due to repulsor math
         repulsor_penalty = 0.0
 
     print(
@@ -134,5 +146,20 @@ def get_reward_gh(
         f"Facade: cols {cols.tolist()}, rows {rows.tolist()}, daylight autonomy {daylight_autonomty_reward:.2f}"
     )
 
+    # Return both total reward and individual components
+    reward_components = {
+        'total_reward': reward,
+        'cyclops_reward': cyclops_reward,
+        'karamba_reward': karamba_reward,
+        'panel_cost_reward': panel_cost_reward,
+        'panel_waste_reward': panel_waste_reward,
+        'daylight_autonomy_reward': daylight_autonomty_reward,
+        'repulsor_penalty': repulsor_penalty,
+        'weighted_cyclops': sun_wt * cyclops_reward,
+        'weighted_karamba': str_wt * karamba_reward,
+        'weighted_panel_cost': cst_wt * panel_cost_reward,
+        'weighted_panel_waste': wst_wt * panel_waste_reward,
+        'weighted_daylight_autonomy': day_wt * daylight_autonomty_reward
+    }
 
-    return reward
+    return reward, reward_components

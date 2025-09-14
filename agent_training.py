@@ -164,7 +164,7 @@ class RhinoRestartCallback(BaseCallback):
 # CLI args
 # ---------------------------
 parser = argparse.ArgumentParser(description='Train MaskablePPO agent for voxel environment')
-parser.add_argument('--port', type=int, default=81, help='Base port number for VoxelEnv (default: 81)')
+parser.add_argument('--port', type=int, default=81, help='Rhino.Compute coordinator port for all environments (default: 81)')
 parser.add_argument('--new', action='store_true', default=False,
                     help='Start a brand new model (ignore checkpoints and saved models)')
 parser.add_argument('--checkpoint', action='store_true', default=False,
@@ -188,6 +188,10 @@ parser.add_argument('--early-done-min-voxels', type=float, default=0.1,
                     help='Minimum fraction (<=1) or absolute count (>1) of active voxels required for DONE bonus')
 parser.add_argument('--log-actions-every', type=int, default=100,
                     help='Log episode actions every N episodes (default: 100, set to 0 to disable)')
+parser.add_argument('--load-model', type=str, default=None,
+                    help='Exact path OR basename (without .zip) of a saved model in models/PPO/')
+parser.add_argument('--checkpoint-file', type=str, default=None,
+                    help='Exact checkpoint filename inside models/PPO/checkpoints/ to resume (overrides --checkpoint)')
 args = parser.parse_args()
 
 GRID_PARAM = parse_grid(args.grid)
@@ -267,6 +271,33 @@ elif not args.new:
         print("No saved models found. Starting fresh.")
         args.new = True
 
+# After determining model_name / before env creation:
+explicit_model_path = None
+if args.checkpoint_file:
+    ck_path = os.path.join(checkpoint_dir, args.checkpoint_file)
+    if not os.path.isfile(ck_path):
+        raise FileNotFoundError(f"--checkpoint-file not found: {ck_path}")
+    print(f"Resuming from explicit checkpoint: {args.checkpoint_file}")
+    model_path = ck_path
+    model_name = os.path.splitext(args.checkpoint_file)[0]
+    args.checkpoint = True  # enforce checkpoint load
+elif args.load_model:
+    # Accept absolute path or basename (with or without .zip)
+    cand = args.load_model
+    if not cand.endswith(".zip"):
+        cand_zip = cand + ".zip"
+    else:
+        cand_zip = cand
+    if os.path.isabs(cand_zip):
+        mp = cand_zip
+    else:
+        mp = os.path.join(model_dir, cand_zip)
+    if not os.path.isfile(mp):
+        raise FileNotFoundError(f"--load-model target not found: {mp}")
+    print(f"Loading explicit saved model: {mp}")
+    model_name = os.path.splitext(os.path.basename(mp))[0]
+    explicit_model_path = mp
+    args.new = False  # force load path
 
 # ---------------------------
 # Vec env factory (now with proper model name)
@@ -317,19 +348,21 @@ class RewardNormVecEnv(VecEnvWrapper):
 def make_single_env(rank: int = 0):
     def _thunk():
         e = VoxelEnv(
-            port=args.port + rank,
+            port=args.port,  # All environments use the same coordinator port
             grid_size=GRID_PARAM,
             device='cpu',
             step_penalty=0.01,
-            str_wt=2.0,
-            sun_wt=0.5,
-            wst_wt=0.1,
-            cst_wt=0.1,
-            day_wt=0.5,
-            num_repulsors=2,
-            repulsor_wt=0.1,
+            str_wt=0.3, # 2.0
+            sun_wt=0.15, # 0.4
+            wst_wt=0.05, # 0.005
+            cst_wt=0.05, # 0.05
+            day_wt=0.15, # 0.4
+            num_repulsors=1,
             repulsor_radius=3.0,
             repulsor_provider="random",
+            height_wt=0.6,
+            repulsor_clear_wt=0.5,
+            repulsor_penalty_wt=0.5,
             early_done=args.early_done,
             early_done_bonus=args.early_done_bonus,
             early_done_min_voxels=args.early_done_min_voxels,
@@ -345,6 +378,7 @@ def make_single_env(rank: int = 0):
     return _thunk
 
 num_envs = max(1, args.n_envs)
+print(f"[ENV] Creating {num_envs} environments, all connecting to Rhino.Compute coordinator on port {args.port}")
 env = DummyVecEnv([make_single_env(i) for i in range(num_envs)])
 env = VecMonitor(env)
 
@@ -367,11 +401,14 @@ else:
 # Now actually load the models with the environment created
 if args.checkpoint:
     model = MaskablePPO.load(model_path, env=env, device="cpu")
-    # override lr schedule when resuming
+    model.lr_schedule = lr_schedule
+elif explicit_model_path:
+    model = MaskablePPO.load(explicit_model_path, env=env, device="cpu")
+    starting_step = getattr(model, "_total_timesteps", 0)
     model.lr_schedule = lr_schedule
 elif not args.new and 'latest_model' in locals():
     model = MaskablePPO.load(os.path.join(model_dir, f"{model_name}.zip"), env=env, device='cpu')
-    starting_step = model._total_timesteps if hasattr(model, "_total_timesteps") else 0
+    starting_step = getattr(model, "_total_timesteps", 0)
     model.lr_schedule = lr_schedule
 
 # When creating a new model (policy always MultiInputPolicy for Dict)
@@ -421,7 +458,6 @@ rhino_callback = RhinoRestartCallback(
     verbose=1
 )
 
-# Add this class before the training setup
 class LastEpisodeCallback(BaseCallback):
     """Callback to capture actions from the last episode of training"""
     def __init__(self, verbose: int = 0):
@@ -526,10 +562,8 @@ class EpochTrackingCallback(BaseCallback):
         
         return True
 
-# Add the callback to the combined callback list
 last_episode_callback = LastEpisodeCallback(verbose=1)
 
-# Add epoch tracking callback for step export
 epoch_tracking_callback = EpochTrackingCallback(
     vec_env=env,
     num_steps=num_steps,
@@ -549,7 +583,6 @@ model.learn(
     reset_num_timesteps=False
 )
 
-# Saving normalization stats (only for VecNormalize)
 if use_vecnormalize:
     env.save(norm_path)
     print(f"Saved VecNormalize stats: {norm_path}")

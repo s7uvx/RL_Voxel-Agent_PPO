@@ -16,7 +16,7 @@ class VoxelEnv(Env):
     """
     def __init__(self, port, grid_size=5, device=None, max_steps=200, cooldown_steps=7, step_penalty=0.0,
                  num_repulsors: int = 2, sun_wt = 0.5, str_wt = 0.3, cst_wt = 0.1, wst_wt = 0.1, day_wt = 0.1,
-                 repulsor_wt: float = 0.2, repulsor_radius: float = 2.0,
+                 repulsor_penalty_wt: float = 0.2, repulsor_radius: float = 2.0,
                  repulsor_provider: str = "edge",
                  early_done: bool = False,
                  early_done_bonus: float = 0.0,
@@ -25,7 +25,9 @@ class VoxelEnv(Env):
                  actions_output_dir: str = "episode_actions",
                  export_last_epoch_episode: bool = False,
                  model_name: str = "model",
-                 log_actions_every: int = 100):
+                 log_actions_every: int = 100,
+                 height_wt: float = 0.0,
+                 repulsor_clear_wt: float = 0.0):
         super(VoxelEnv, self).__init__()
         # Normalize grid_size to 3D dims (gx, gy, gz)
         if isinstance(grid_size, (list, tuple, np.ndarray)):
@@ -42,6 +44,11 @@ class VoxelEnv(Env):
             raise ValueError("grid dimensions must be positive")
 
         self.gx, self.gy, self.gz = int(gx), int(gy), int(gz)
+        self.height_wt = float(height_wt)
+        self.repulsor_clear_wt = float(repulsor_clear_wt)
+        self.repulsor_penalty_wt = float(repulsor_penalty_wt)
+        self._max_repulsor_dist = np.linalg.norm([self.gx-1, self.gy-1, self.gz-1])
+    
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.grid = np.zeros((self.gx, self.gy, self.gz), dtype=np.int32)
 
@@ -124,7 +131,7 @@ class VoxelEnv(Env):
         self.day_wt = day_wt
         # Repulsor config
         self.num_repulsors = num_repulsors
-        self.repulsor_wt = repulsor_wt
+        # self.repulsor_wt = repulsor_wt
         self.repulsor_radius = repulsor_radius
         self.repulsor_provider = repulsor_provider
         self._set_repulsors()
@@ -172,6 +179,56 @@ class VoxelEnv(Env):
     # ---------------------------
     # Utilities
     # ---------------------------
+    def _compute_height_reward(self):
+        """
+        Reward components:
+          max_height_norm: tallest occupied voxel z / (gz-1)
+          mean_height_norm: mean column height / gz
+        Returns scalar (unweighted) combination = 0.6*max + 0.4*mean
+        """
+        if not np.any(self.grid):
+            return 0.0
+        # Column heights: highest z with voxel (or -1)
+        occ = self.grid > 0
+        heights = np.where(occ.any(axis=2),
+                           occ.shape[2] - np.argmax(occ[:, :, ::-1] == 1, axis=2) - 1,
+                           -1)
+        valid = heights >= 0
+        if not np.any(valid):
+            return 0.0
+        max_h = heights[valid].max()
+        mean_h = heights[valid].mean()
+        max_height_norm = (max_h / (self.gz - 1)) if self.gz > 1 else 0.0
+        mean_height_norm = (mean_h / self.gz) if self.gz > 0 else 0.0
+        return 0.6 * max_height_norm + 0.4 * mean_height_norm
+
+    def _compute_repulsor_shaping(self):
+        """
+        Returns (positive_clear_reward, negative_intersection_penalty_unweighted)
+        positive_clear_reward: average normalized distance of occupied voxels to nearest repulsor
+        negative_intersection_penalty_unweighted: number of occupied voxels that exactly coincide with a repulsor point
+        """
+        if not hasattr(self, 'repulsors') or not self.repulsors:
+            return 0.0, 0.0
+        vox_idx = np.argwhere(self.grid == 1)
+        if vox_idx.size == 0:
+            return 0.0, 0.0
+        reps = np.array(self.repulsors, dtype=np.float32)
+        # Distance matrix: for efficiency compute min distances iteratively (repulsor count usually small)
+        dmins = []
+        intersect_count = 0
+        rep_set = { (int(r[0]), int(r[1]), int(r[2])) for r in reps }
+        for (x, y, z) in vox_idx:
+            if (int(x), int(y), int(z)) in rep_set:
+                intersect_count += 1
+            diffs = reps - np.array([x, y, z], dtype=np.float32)
+            dist = np.sqrt((diffs * diffs).sum(axis=1)).min()
+            dmins.append(dist)
+        dmins = np.array(dmins, dtype=np.float32)
+        # Normalize by max possible distance to keep in [0,1]
+        clear_reward = float(np.clip(dmins.mean() / max(1e-6, self._max_repulsor_dist), 0.0, 1.0))
+        return clear_reward, float(intersect_count)
+    
     def _build_central_tower(self):
         """
         Ensure a solid vertical tower of voxels from z=0..gz-1 at (root_x, root_y, z).
@@ -262,9 +319,24 @@ class VoxelEnv(Env):
         self.current_facade_params[param_name][direction_idx] = value
 
         if not compute_reward:
-            return 0.0
+            # Return consistent format even when not computing reward
+            empty_components = {
+                'total_reward': 0.0,
+                'cyclops_reward': 0.0,
+                'karamba_reward': 0.0,
+                'panel_cost_reward': 0.0,
+                'panel_waste_reward': 0.0,
+                'daylight_autonomy_reward': 0.0,
+                'repulsor_penalty': 0.0,
+                'weighted_cyclops': 0.0,
+                'weighted_karamba': 0.0,
+                'weighted_panel_cost': 0.0,
+                'weighted_panel_waste': 0.0,
+                'weighted_daylight_autonomy': 0.0
+            }
+            return 0.0, empty_components
 
-        reward = get_reward_gh(
+        reward, reward_dict = get_reward_gh(
             self.grid, 
             self.merged_gh_file, 
             self.current_epw, 
@@ -276,7 +348,7 @@ class VoxelEnv(Env):
             repulsors=self.repulsors,
             facade_params=self.current_facade_params)
         
-        return reward
+        return reward, reward_dict
     
     def _set_repulsors(self):
         if self.repulsor_provider == "random":
@@ -334,7 +406,8 @@ class VoxelEnv(Env):
         # If early_done is enabled, we need to handle the extra action index
         if self.early_done:
             # The base mask corresponds to the first N actions, so we append a placeholder for the DONE action
-            full_mask = np.zeros(self.action_space.n, dtype=bool)
+            total_actions = self._combo_action_count + 1
+            full_mask = np.zeros(total_actions, dtype=bool)
             full_mask[:self._combo_action_count] = base_mask
             # The DONE action is always available if enabled
             full_mask[self.DONE_IDX] = True
@@ -429,35 +502,6 @@ class VoxelEnv(Env):
         # Rebuild central tower for new episode
         self._build_central_tower()
 
-        # Generate per-episode repulsor points (use hook if provided; else random)
-        # self.repulsors = []
-        # def _random_repulsors() -> list[list[int]]:
-        #     pts: list[list[int]] = []
-        #     for _ in range(max(0, int(self.num_repulsors))):
-        #         rx = int(rng.integers(0, self.gx))
-        #         ry = int(rng.integers(0, self.gy))
-        #         rz = int(rng.integers(0, self.gz))
-        #         pts.append([rx, ry, rz])
-        #     return pts
-
-        # if self.repulsor_provider is not None:
-        #     try:
-        #         provided = list(self.repulsor_provider(self, rng))  # expect iterable of 3D points
-        #         arr = np.asarray(provided, dtype=float)
-        #         if arr.ndim == 1:
-        #             arr = arr.reshape(1, -1)
-        #         if arr.size == 0 or arr.shape[1] < 3:
-        #             raise ValueError("Repulsor provider must yield points with at least 3 coordinates")
-        #         coords = np.rint(arr[:, :3]).astype(int)
-        #         coords[:, 0] = np.clip(coords[:, 0], 0, self.gx - 1)
-        #         coords[:, 1] = np.clip(coords[:, 1], 0, self.gy - 1)
-        #         coords[:, 2] = np.clip(coords[:, 2], 0, self.gz - 1)
-        #         self.repulsors = coords.tolist()[: max(0, int(self.num_repulsors))]
-        #     except Exception:
-        #         # Fallback to random on any provider error
-        #         self.repulsors = _random_repulsors()
-        # else:
-        #     self.repulsors = _random_repulsors()
         self._set_repulsors()
         # Pick EPW for this episode
         self.current_epw = np.random.choice(self.epw_files)
@@ -585,13 +629,29 @@ class VoxelEnv(Env):
         (voxel_type, voxel_payload), facade_part = self._decode_combined_action(int(action_idx))
         reward = 0.0
         step_msgs = []
-
+        
+        # Initialize reward_dict with empty components (will be updated by GH calls)
+        reward_dict = {
+            'total_reward': 0.0,
+            'cyclops_reward': 0.0,
+            'karamba_reward': 0.0,
+            'panel_cost_reward': 0.0,
+            'panel_waste_reward': 0.0,
+            'daylight_autonomy_reward': 0.0,
+            'repulsor_penalty': 0.0,
+            'weighted_cyclops': 0.0,
+            'weighted_karamba': 0.0,
+            'weighted_panel_cost': 0.0,
+            'weighted_panel_waste': 0.0,
+            'weighted_daylight_autonomy': 0.0,
+            'toggle_penalty': 0.0
+        }
         # Apply facade first (no reward yet if a voxel op will follow)
         if facade_part is not None:
             _, (param_name, direction_idx, value, direction_name) = facade_part
             # If a voxel op happens, skip reward here to avoid double GH calls
             compute_reward = (voxel_type == "noop")
-            facade_r = self._apply_facade_action(param_name, direction_idx, value, compute_reward=compute_reward)
+            facade_r, reward_dict = self._apply_facade_action(param_name, direction_idx, value, compute_reward=compute_reward)
             step_msgs.append(f"FACADE {param_name}[{direction_name}] = {value}")
             reward += float(facade_r)
 
@@ -609,18 +669,32 @@ class VoxelEnv(Env):
             msg = "NOOP"
         elif voxel_type == "add":
             x, y, z = voxel_payload
-            base_reward = self._add_voxel(x, y, z)  # calls GH with current (possibly updated) facade params
+            base_reward, reward_dict = self._add_voxel(x, y, z)  # calls GH with current (possibly updated) facade params
             reward += float(base_reward)
             msg = f"ADD at ({x},{y},{z})"
         elif voxel_type == "delete":
             x, y, z = voxel_payload
-            base_reward = self._delete_voxel(x, y, z)  # calls GH with current (possibly updated) facade params
+            base_reward, reward_dict = self._delete_voxel(x, y, z)  # calls GH with current (possibly updated) facade params
             reward += float(base_reward)
             msg = f"DELETE at ({x},{y},{z})"
         else:
             reward += -0.5
             msg = "INVALID"
 
+        height_component = 0.0
+        rep_clear_component = 0.0
+        rep_intersections = 0.0
+        rep_penalty_component = 0.0
+        if self.height_wt > 0.0:
+            height_component = self._compute_height_reward()
+            reward += self.height_wt * height_component
+        if (self.repulsor_clear_wt > 0.0) or (self.repulsor_penalty_wt > 0.0):
+            rep_clear_component, rep_intersections = self._compute_repulsor_shaping()
+            if self.repulsor_clear_wt > 0.0:
+                reward += self.repulsor_clear_wt * rep_clear_component
+            if self.repulsor_penalty_wt > 0.0 and rep_intersections > 0:
+                rep_penalty_component = - self.repulsor_penalty_wt * rep_intersections
+                reward += rep_penalty_component
         # Logging
         if step_msgs:
             print(f"[STEP] {' | '.join(step_msgs)}")
@@ -667,7 +741,12 @@ class VoxelEnv(Env):
             "facade_params": self.current_facade_params.copy(),
             "unstuck": unstuck,
             "exhausted_actions": exhausted_actions,
-            "episode_return": self.episode_return
+            "episode_return": self.episode_return,
+            "height_component": height_component,
+            "rep_clear_component": rep_clear_component,
+            "rep_intersections": rep_intersections,
+            "rep_penalty_component": rep_penalty_component,
+            "reward_dict" : reward_dict
         }
         
         # Store reward and info after processing
@@ -688,19 +767,39 @@ class VoxelEnv(Env):
         try:
             r = float(r)
         except Exception:
-            return -1.0
+            print('float issue in safe reward')
+            return -0.0
         if not np.isfinite(r):
-            return -1.0
+            print('isfinite issue in safe reward')
+            return -0.0
         return r
+
+    def _error_reward_with_components(self, reward_value: float):
+        """Return error reward with empty components in proper format."""
+        empty_components = {
+            'total_reward': reward_value,
+            'cyclops_reward': 0.0,
+            'karamba_reward': 0.0,
+            'panel_cost_reward': 0.0,
+            'panel_waste_reward': 0.0,
+            'daylight_autonomy_reward': 0.0,
+            'repulsor_penalty': 0.0,
+            'weighted_cyclops': 0.0,
+            'weighted_karamba': 0.0,
+            'weighted_panel_cost': 0.0,
+            'weighted_panel_waste': 0.0,
+            'weighted_daylight_autonomy': 0.0
+        }
+        return reward_value, empty_components
 
     def _add_voxel(self, x, y, z):
         """Add a voxel at specific coordinates with validation"""
         if not (0 <= x < self.gx and 0 <= y < self.gy and 0 <= z < self.gz):
-            return -0.5  # Invalid coordinates
+            return self._error_reward_with_components(-0.5)  # Invalid coordinates
         if self.grid[x, y, z] == 1:
-            return -0.3  # Already occupied
+            return self._error_reward_with_components(-0.3)  # Already occupied
         if not self._is_adjacent_to_structure(x, y, z):
-            return -0.4  # Not connected to existing structure
+            return self._error_reward_with_components(-0.4)  # Not connected to existing structure
 
         print(f"[ADD] Adding voxel at ({x}, {y}, {z})")
         self.grid[x, y, z] = 1
@@ -711,7 +810,7 @@ class VoxelEnv(Env):
             self._deleted_cooldown.pop((x, y, z), None)
 
         # Get reward from Grasshopper (now includes facade parameters)
-        reward = get_reward_gh(
+        reward, reward_dict = get_reward_gh(
             self.grid,
             self.merged_gh_file,
             self.current_epw,
@@ -721,32 +820,34 @@ class VoxelEnv(Env):
             self.wst_wt,
             self.day_wt, 
             repulsors=self.repulsors,
-            repulsor_wt=self.repulsor_wt,
+            repulsor_wt=self.repulsor_penalty_wt,
             repulsor_radius=self.repulsor_radius,
             facade_params=self.current_facade_params,
         )
         # Apply loop-churn penalty for flipping this voxel
-        reward -= self._toggle_penalty(x, y, z)
-        return self._safe_reward(reward)
+        toggle_penalty = self._toggle_penalty(x, y, z)
+        reward -= toggle_penalty
+        reward_dict['toggle_penalty'] = toggle_penalty
+        return self._safe_reward(reward), reward_dict
 
     def _delete_voxel(self, x, y, z):
         """Delete a voxel at specific coordinates with connectivity validation"""
         # Block deletion if voxel is part of the enforced central tower
         if (x, y, z) in getattr(self, "central_tower_set", ()):
-            return -0.4  # Protected backbone voxel
+            return self._error_reward_with_components(-0.4)  # Protected backbone voxel
 
         if not (0 <= x < self.gx and 0 <= y < self.gy and 0 <= z < self.gz):
-            return -0.5  # Invalid coordinates
+            return self._error_reward_with_components(-0.5)  # Invalid coordinates
         if self.grid[x, y, z] == 0:
-            return -0.3  # Nothing to delete
+            return self._error_reward_with_components(-0.3)  # Nothing to delete
         if (x, y, z) == self.root_voxel:
-            return -0.4  # Cannot delete root voxel
+            return self._error_reward_with_components(-0.4)  # Cannot delete root voxel
 
         # Tentative delete with connectivity check
         self.grid[x, y, z] = 0
         if not self._is_structure_connected():
             self.grid[x, y, z] = 1
-            return -0.4
+            return self._error_reward_with_components(-0.4)
 
         print(f"[DELETE] Removing voxel at ({x}, {y}, {z})")
 
@@ -756,7 +857,7 @@ class VoxelEnv(Env):
             self._added_cooldown.pop((x, y, z), None)
 
         # Get reward from Grasshopper (now includes facade parameters)
-        reward = get_reward_gh(
+        reward, reward_dict = get_reward_gh(
             self.grid,
             self.merged_gh_file,
             self.current_epw,
@@ -766,13 +867,15 @@ class VoxelEnv(Env):
             self.wst_wt,
             self.day_wt,
             repulsors=self.repulsors,
-            repulsor_wt=self.repulsor_wt,
+            repulsor_wt=self.repulsor_penalty_wt,
             repulsor_radius=self.repulsor_radius,
             facade_params=self.current_facade_params,
         )
         # Apply loop-churn penalty for flipping this voxel
-        reward -= self._toggle_penalty(x, y, z)
-        return self._safe_reward(reward)
+        toggle_penalty = self._toggle_penalty(x, y, z)
+        reward -= toggle_penalty
+        reward_dict['toggle_penalty'] = toggle_penalty
+        return self._safe_reward(reward), reward_dict
 
     def _is_adjacent_to_structure(self, x, y, z):
         """Check if position (x,y,z) is adjacent to existing structure"""
@@ -968,6 +1071,30 @@ class VoxelEnv(Env):
                 else:
                     return obj
             
+            # Calculate aggregate reward statistics
+            reward_component_sums = {
+                'total_reward': 0.0,
+                'cyclops_reward': 0.0,
+                'karamba_reward': 0.0,
+                'panel_cost_reward': 0.0,
+                'panel_waste_reward': 0.0,
+                'daylight_autonomy_reward': 0.0,
+                'repulsor_penalty': 0.0,
+                'weighted_cyclops': 0.0,
+                'weighted_karamba': 0.0,
+                'weighted_panel_cost': 0.0,
+                'weighted_panel_waste': 0.0,
+                'weighted_daylight_autonomy': 0.0,
+                'toggle_penalty': 0.0
+            }
+            
+            # Sum up reward components across all steps
+            for step_info in self.current_episode_infos:
+                if "reward_dict" in step_info:
+                    for key, value in step_info["reward_dict"].items():
+                        if key in reward_component_sums:
+                            reward_component_sums[key] += float(value)
+            
             # Create episode summary
             episode_data = {
                 "episode_number": self.episode_count,
@@ -978,6 +1105,7 @@ class VoxelEnv(Env):
                 "grid_size": [self.gx, self.gy, self.gz],
                 "root_voxel": list(self.root_voxel),
                 "final_facade_params": {k: v.tolist() for k, v in self.current_facade_params.items()},
+                "reward_component_totals": reward_component_sums,
                 "actions": []
             }
             
@@ -1021,6 +1149,9 @@ class VoxelEnv(Env):
                     step_info = self.current_episode_infos[step]
                     if "unstuck" in step_info:
                         action_info["unstuck"] = step_info["unstuck"]
+                    # Add reward components if available
+                    if "reward_dict" in step_info:
+                        action_info["reward_components"] = step_info["reward_dict"]
                 
                 episode_data["actions"].append(action_info)
             
