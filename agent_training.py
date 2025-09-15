@@ -13,12 +13,11 @@ from sb3_contrib.common.wrappers import ActionMasker
 
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
 from stable_baselines3.common.vec_env import VecEnvWrapper
-from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
 from gymnasium import wrappers
 from gymnasium import spaces as gym_spaces
 
-from voxel_env import VoxelEnv, export_voxel_grid
+from voxel_env import VoxelEnv
 
 from torch.distributions import Distribution
 Distribution.set_default_validate_args(False)
@@ -95,7 +94,7 @@ def _start_rhino_new_window(script_path: str):
         return None
     try:
         # Launch a new PowerShell window using os.startfile (opens with associated handler)
-        # os.startfile(script_path)  # NOTE: no direct PID returned
+    # Launch PowerShell script (no direct PID returned)
         os.system(f"start powershell {script_path}")
         time.sleep(10.0)  # Increased wait time for Rhino to fully start (was 1.5)
         proc = _locate_ps_process(script_path)
@@ -302,7 +301,7 @@ elif args.load_model:
 # ---------------------------
 # Vec env factory (now with proper model name)
 # ---------------------------
-# REMOVE old RewardNormalizeWrapper and add VecEnv wrapper
+# Reward normalization: custom wrapper replaces prior implementation
 class RewardNormVecEnv(VecEnvWrapper):
     """
     Reward normalization for Dict (or any) observations when VecNormalize (obs) is not usable.
@@ -345,7 +344,7 @@ class RewardNormVecEnv(VecEnvWrapper):
                 self.returns[i] = 0.0
         return obs, norm_rewards, dones, infos
 
-def make_single_env(rank: int = 0):
+def make_single_env():
     def _thunk():
         e = VoxelEnv(
             port=args.port,  # All environments use the same coordinator port
@@ -451,7 +450,7 @@ checkpoint_callback = CheckpointCallback(
     name_prefix=model_name
 )
 
-# --- ADDED: combine with Rhino restart callback ---
+# Combine checkpointing with Rhino restart and custom logging callbacks
 rhino_callback = RhinoRestartCallback(
     script_path=RHINO_PS1,
     restart_interval=RHINO_RESTART_INTERVAL,
@@ -579,7 +578,7 @@ combined_callback = CallbackList([checkpoint_callback, rhino_callback, last_epis
 model.learn(
     total_timesteps=total_steps,
     progress_bar=True,
-    callback=combined_callback,  # CHANGED: was checkpoint_callback
+    callback=combined_callback,
     reset_num_timesteps=False
 )
 

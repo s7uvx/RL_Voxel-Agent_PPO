@@ -1,7 +1,5 @@
 import compute_rhino3d.Grasshopper as gh
 import json
-import gc
-import os
 import numpy as np
 
 def weird_str_to_float(input_string: str) -> float:
@@ -44,7 +42,7 @@ def get_reward_gh(
             'weighted_daylight_autonomy': 0.0
         }
 
-    # ✅ Convert EPW path to forward slashes
+    # Convert EPW path to forward slashes
     epw_file = epw_file.replace("\\", "/")
 
     # Prepare voxel grid as JSON

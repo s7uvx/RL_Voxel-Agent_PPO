@@ -1,11 +1,10 @@
 import numpy as np
 import os
 import json
-import time
 import torch
 from gymnasium import Env, spaces
 import compute_rhino3d.Util
-from typing import Deque, Tuple, cast, Callable, Iterable, Sequence, Optional
+from typing import Deque, cast, Callable, Iterable, Sequence, Optional
 
 from gh_file_runner import get_reward_gh
 
@@ -97,7 +96,7 @@ class VoxelEnv(Env):
             'rows': np.array([4,4,4,4], dtype=np.int32),
         }
 
-        # REPLACED: single Box -> Dict with voxel + repulsor grids
+    # Observation space: Dict with voxel + repulsor grids
         self.observation_space = spaces.Dict({
             'vox': spaces.Box(low=0, high=1, shape=(self.gx, self.gy, self.gz), dtype=np.float32),
             'rep': spaces.Box(low=0, high=1, shape=(self.gx, self.gy, self.gz), dtype=np.float32)
@@ -549,7 +548,11 @@ class VoxelEnv(Env):
         """Enable step export for last episode of each epoch"""
         self.export_last_epoch_episode = True
         self.model_name = model_name
-        print(f"[EPOCH_EXPORT] ✅ Enabled epoch step export for model: {model_name}")
+        try:
+            model_id = getattr(self, 'model_name', 'model')
+        except Exception:
+            model_id = 'model'
+        print(f"[EPOCH_EXPORT] Enabled epoch step export for model: {model_id}")
 
     def _tick_cooldowns(self):
         # decrement, then purge zeros
@@ -1207,12 +1210,12 @@ class VoxelEnv(Env):
     #                         time.sleep(0.03)
     #                 return float(data.get("reward", 0.0))
     #             except (json.JSONDecodeError, ValueError) as e:
-    #                 print(f"⏳ Waiting for valid reward file... ({e})")
+    #                 print(f"Waiting for valid reward file... ({e})")
     #                 time.sleep(0.1)
     #         else:
     #             if time.time() - start_time > timeout:
     #                 self.timeouts += 1
-    #                 print("❌ Timeout: No external reward received. {} times".format(self.timeouts))
+    #                 print("Timeout: No external reward received. {} times".format(self.timeouts))
     #                 return 0.0
     #             time.sleep(0.1)
 
