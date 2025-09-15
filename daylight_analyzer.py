@@ -14,7 +14,7 @@ from ladybug.wea import Wea
 from ladybug.epw import EPW
 from honeybee_radiance.lightsource.sky import CertainIrradiance
 from lbt_recipes.recipe import Recipe
-print("✅ All honeybee and ladybug dependencies imported successfully")
+print("All honeybee and ladybug dependencies imported successfully")
 
 
 class VoxelDaylightAnalyzer:
@@ -62,9 +62,9 @@ class VoxelDaylightAnalyzer:
             # Create WEA object for sky conditions
             epw = EPW(self.epw_file)
             self.wea = Wea.from_epw_file(self.epw_file)
-            print(f"✅ Weather data loaded: {epw.location}")
+            print(f"Weather data loaded: {epw.location}")
         else:
-            print("❌ Could not find EPW file in archive")
+            print("Could not find EPW file in archive")
     
     def voxels_to_points(self, voxel_grid: np.ndarray) -> List[Point3D]:
         """
@@ -208,10 +208,10 @@ class VoxelDaylightAnalyzer:
                 'model_volume_m3': np.sum(voxel_grid) * (self.voxel_size ** 3)
             }
             
-            print("✅ Radiation analysis completed successfully")
+            print("Radiation analysis completed successfully")
             return analysis_results
         else:
-            print("❌ No results returned from analysis")
+            print("No results returned from analysis")
             return {'error': 'Analysis failed to return results'}
     
     def _calculate_surface_radiation(self, model: Model, irradiance_values: np.ndarray) -> Dict:
