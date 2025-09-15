@@ -11,18 +11,3 @@ dependencies = [
     "tensorboard>=2.20.0",
     "torch==2.7.0",
 ]
-
-[project.optional-dependencies]
-cpu = ["torch==2.7.0"]
-
-[tool.uv.sources]
-# Only pull torch from the CPU index
-torch = [
-  { index = "pytorch-cpu", extra = "cpu" }
-]
-
-[[tool.uv.index]]
-# The pytorch-cpu index is used to install the torch, torchvision, and torchaudio packages
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
